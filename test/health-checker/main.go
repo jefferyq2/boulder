@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jmhodges/clock"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
 	"github.com/letsencrypt/boulder/cmd"
@@ -21,8 +22,6 @@ type config struct {
 }
 
 func main() {
-	defer cmd.AuditPanic()
-
 	// Flag and config parsing and validation.
 	configFile := flag.String("config", "", "Path to the TLS configuration file")
 	serverAddr := flag.String("addr", "", "Address of the gRPC server to check")
@@ -53,7 +52,7 @@ func main() {
 	}
 
 	// GRPC connection prerequisites.
-	clk := cmd.Clock()
+	clk := clock.New()
 
 	// Health check retry and timeout.
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -68,7 +67,6 @@ func main() {
 
 			// Set the hostOverride to match the dNSName in the server certificate.
 			c.GRPC.HostOverride = strings.Replace(hostOverride, ".service.consul", ".boulder", 1)
-			fmt.Fprintf(os.Stderr, "health checking %s (%s)\n", c.GRPC.HostOverride, *serverAddr)
 
 			// Set up the GRPC connection.
 			conn, err := bgrpc.ClientSetup(c.GRPC, tlsConfig, metrics.NoopRegisterer, clk)

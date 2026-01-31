@@ -3,13 +3,25 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"reflect"
 	"time"
 )
 
-// Duration is just an alias for time.Duration that allows
-// serialization to YAML as well as JSON.
+// Duration is custom type embedding a time.Duration which allows defining
+// methods such as serialization to YAML or JSON.
 type Duration struct {
 	time.Duration `validate:"required"`
+}
+
+// DurationCustomTypeFunc enables registration of our custom config.Duration
+// type as a time.Duration and performing validation on the configured value
+// using the standard suite of validation functions.
+func DurationCustomTypeFunc(field reflect.Value) any {
+	if c, ok := field.Interface().(Duration); ok {
+		return c.Duration
+	}
+
+	return reflect.Invalid
 }
 
 // ErrDurationMustBeString is returned when a non-string value is
@@ -41,7 +53,7 @@ func (d Duration) MarshalJSON() ([]byte, error) {
 
 // UnmarshalYAML uses the same format as JSON, but is called by the YAML
 // parser (vs. the JSON parser).
-func (d *Duration) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (d *Duration) UnmarshalYAML(unmarshal func(any) error) error {
 	var s string
 	err := unmarshal(&s)
 	if err != nil {
@@ -54,4 +66,9 @@ func (d *Duration) UnmarshalYAML(unmarshal func(interface{}) error) error {
 
 	d.Duration = dur
 	return nil
+}
+
+// MarshalYAML returns the string form of the duration, as a string.
+func (d Duration) MarshalYAML() (any, error) {
+	return d.Duration.String(), nil
 }

@@ -1,0 +1,29 @@
+{{define "header"}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Let's Encrypt - Portal</title>
+    <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="header">
+        <div class="container">
+            <img src="/static/logo.svg" alt="Let's Encrypt" id="logo">
+        </div>
+    </div>
+{{ end }}
+
+{{ define "footer" }}
+<div class="footer">
+    <div class="container">
+        <p>
+            <a href="https://letsencrypt.org">Let's Encrypt</a> is a free, automated, and open certificate authority brought to you by the nonprofit <a href="https://www.isrg.org/">Internet Security Research Group (ISRG)</a>.
+        </p>
+    </div>
+</div>
+</body>
+</html>
+{{ end }}

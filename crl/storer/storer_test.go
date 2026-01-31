@@ -29,10 +29,6 @@ import (
 	"github.com/letsencrypt/boulder/test"
 )
 
-func TestImplementation(t *testing.T) {
-	test.AssertImplementsGRPCServer(t, &crlStorer{}, cspb.UnimplementedCRLStorerServer{})
-}
-
 type fakeUploadCRLServerStream struct {
 	grpc.ServerStream
 	input <-chan *cspb.UploadCRLRequest
@@ -66,8 +62,8 @@ func setupTestUploadCRL(t *testing.T) (*crlStorer, *issuance.Issuer) {
 				CertFile: "../../test/hierarchy/int-e1.cert.pem",
 			},
 			IssuerURL:  "http://not-example.com/issuer-url",
-			OCSPURL:    "http://not-example.com/ocsp",
 			CRLURLBase: "http://not-example.com/crl/",
+			CRLShards:  1,
 		}, clock.NewFake())
 	test.AssertNotError(t, err, "loading fake ECDSA issuer cert")
 

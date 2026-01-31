@@ -10,6 +10,8 @@ import (
 // Common contains all of the shared fields for a VA and a Remote VA (RVA).
 type Common struct {
 	cmd.ServiceConfig
+	// UserAgent is the "User-Agent" header sent during http-01 challenges and
+	// DoH queries.
 	UserAgent string
 
 	IssuerDomain string
@@ -26,6 +28,9 @@ type Common struct {
 	DNSTimeout                config.Duration `validate:"required"`
 	DNSAllowLoopbackAddresses bool
 
+	// AccountURIPrefixes is a list of prefixes used to construct account URIs.
+	// The first prefix in the list is used for dns-account-01 challenges.
+	// All of the prefixes are used for CAA accounturi validation.
 	AccountURIPrefixes []string `validate:"min=1,dive,required,url"`
 }
 

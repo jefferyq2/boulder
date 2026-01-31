@@ -15,31 +15,23 @@ import (
 // then call features.Set(parsedConfig) to load the parsed struct into this
 // package's global Config.
 type Config struct {
-	// Deprecated features. Safe for removal once all references to them have
-	// been removed from deployed configuration.
-	CAAAfterValidation         bool
-	AllowNoCommonName          bool
-	SHA256SubjectKeyIdentifier bool
-
-	// EnforceMultiVA causes the VA to block on remote VA PerformValidation
-	// requests in order to make a valid/invalid decision with the results.
-	EnforceMultiVA bool
-	// MultiVAFullResults will cause the main VA to wait for all of the remote VA
-	// results, not just the threshold required to make a decision.
-	MultiVAFullResults bool
-
-	// ECDSAForAll enables all accounts, regardless of their presence in the CA's
-	// ecdsaAllowedAccounts config value, to get issuance from ECDSA issuers.
-	ECDSAForAll bool
-
-	// ServeRenewalInfo exposes the renewalInfo endpoint in the directory and for
-	// GET requests. WARNING: This feature is a draft and highly unstable.
-	ServeRenewalInfo bool
-
-	// ExpirationMailerUsesJoin enables using a JOIN query in expiration-mailer
-	// rather than a SELECT from certificateStatus followed by thousands of
-	// one-row SELECTs from certificates.
-	ExpirationMailerUsesJoin bool
+	// Deprecated flags.
+	IncrementRateLimits         bool
+	UseKvLimitsForNewOrder      bool
+	DisableLegacyLimitWrites    bool
+	MultipleCertificateProfiles bool
+	InsertAuthzsIndividually    bool
+	EnforceMultiCAA             bool
+	EnforceMPIC                 bool
+	MPICFullResults             bool
+	UnsplitIssuance             bool
+	ExpirationMailerUsesJoin    bool
+	DOH                         bool
+	IgnoreAccountContacts       bool
+	NoPendingAuthzReuse         bool
+	ServeRenewalInfo            bool
+	StoreAuthzsInOrders         bool
+	StoreARIReplacesInOrders    bool
 
 	// CertCheckerChecksValidations enables an extra query for each certificate
 	// checked, to find the relevant authzs. Since this query might be
@@ -51,12 +43,6 @@ type Config struct {
 	// authorizations.
 	CertCheckerRequiresValidations bool
 
-	// CertCheckerRequiresCorrespondence enables an extra query for each certificate
-	// checked, to find the linting precertificate in the `precertificates` table.
-	// It then checks that the final certificate "corresponds" to the precertificate
-	// using `precert.Correspond`.
-	CertCheckerRequiresCorrespondence bool
-
 	// AsyncFinalize enables the RA to return approximately immediately from
 	// requests to finalize orders. This allows us to take longer getting SCTs,
 	// issuing certs, and updating the database; it indirectly reduces the number
@@ -65,38 +51,31 @@ type Config struct {
 	// for the cert URL to appear.
 	AsyncFinalize bool
 
-	// DOH enables DNS-over-HTTPS queries for validation
-	DOH bool
+	// CheckIdentifiersPaused checks if any of the identifiers in the order are
+	// currently paused at NewOrder time. If any are paused, an error is
+	// returned to the Subscriber indicating that the order cannot be processed
+	// until the paused identifiers are unpaused and the order is resubmitted.
+	CheckIdentifiersPaused bool
 
-	// EnforceMultiCAA causes the VA to kick off remote CAA rechecks when true.
-	// When false, no remote CAA rechecks will be performed. The primary VA will
-	// make a valid/invalid decision with the results. The primary VA will
-	// return an early decision if MultiCAAFullResults is false.
-	EnforceMultiCAA bool
+	// PropagateCancels controls whether the WFE allows
+	// cancellation of an inbound request to cancel downstream gRPC and other
+	// queries. In practice, cancellation of an inbound request is achieved by
+	// Nginx closing the connection on which the request was happening. This may
+	// help shed load in overcapacity situations. However, note that in-progress
+	// database queries (for instance, in the SA) are not cancelled. Database
+	// queries waiting for an available connection may be cancelled.
+	PropagateCancels bool
 
-	// MultiCAAFullResults will cause the main VA to block and wait for all of
-	// the remote VA CAA recheck results instead of returning early if the
-	// number of failures is greater than the configured
-	// maxRemoteValidationFailures. Only used when EnforceMultiCAA is true.
-	MultiCAAFullResults bool
+	// AutomaticallyPauseZombieClients configures the RA to automatically track
+	// and pause issuance for each (account, hostname) pair that repeatedly
+	// fails validation.
+	AutomaticallyPauseZombieClients bool
 
-	// TrackReplacementCertificatesARI, when enabled, triggers the following
-	// behavior:
-	//   - SA.NewOrderAndAuthzs: upon receiving a NewOrderRequest with a
-	//     'replacesSerial' value, will create a new entry in the 'replacement
-	//     Orders' table. This will occur inside of the new order transaction.
-	//   - SA.FinalizeOrder will update the 'replaced' column of any row with
-	//     a 'orderID' matching the finalized order to true. This will occur
-	//     inside of the finalize (order) transaction.
-	TrackReplacementCertificatesARI bool
-
-	// MultipleCertificateProfiles, when enabled, triggers the following
-	// behavior:
-	//   - SA.NewOrderAndAuthzs: upon receiving a NewOrderRequest with a
-	//     `certificateProfileName` value, will add that value to the database's
-	//     `orders.certificateProfileName` column. Values in this column are
-	//     allowed to be empty.
-	MultipleCertificateProfiles bool
+	// DNSAccount01Enabled controls support for the dns-account-01 challenge
+	// type. When enabled, the server can offer and validate this challenge
+	// during certificate issuance. This flag must be set to true in the
+	// RA, VA, and WFE2 services for full functionality.
+	DNSAccount01Enabled bool
 }
 
 var fMu = new(sync.RWMutex)

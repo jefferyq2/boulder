@@ -3,13 +3,16 @@ package probers
 import (
 	"fmt"
 	"net"
+	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 
-	"github.com/letsencrypt/boulder/observer/probers"
-	"github.com/letsencrypt/boulder/strictyaml"
 	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/letsencrypt/boulder/observer/probers"
+	"github.com/letsencrypt/boulder/strictyaml"
 )
 
 var (
@@ -58,13 +61,12 @@ func (c DNSConf) validateServer() error {
 		return fmt.Errorf(
 			"invalid `server`, %q, port number must be one in [1-65535]", c.Server)
 	}
-	// Ensure `server` is a valid FQDN or IPv4 / IPv6 address.
-	IPv6 := net.ParseIP(host).To16()
-	IPv4 := net.ParseIP(host).To4()
+	// Ensure `server` is a valid FQDN or IP address.
+	_, err = netip.ParseAddr(host)
 	FQDN := dns.IsFqdn(dns.Fqdn(host))
-	if IPv6 == nil && IPv4 == nil && !FQDN {
+	if err != nil && !FQDN {
 		return fmt.Errorf(
-			"invalid `server`, %q, is not an FQDN or IPv4 / IPv6 address", c.Server)
+			"invalid `server`, %q, is not an FQDN or IP address", c.Server)
 	}
 	return nil
 }
@@ -72,10 +74,8 @@ func (c DNSConf) validateServer() error {
 func (c DNSConf) validateProto() error {
 	validProtos := []string{"udp", "tcp"}
 	proto := strings.Trim(strings.ToLower(c.Proto), " ")
-	for _, i := range validProtos {
-		if proto == i {
-			return nil
-		}
+	if slices.Contains(validProtos, proto) {
+		return nil
 	}
 	return fmt.Errorf(
 		"invalid `protocol`, got: %q, expected one in: %s", c.Proto, validProtos)

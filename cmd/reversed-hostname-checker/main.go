@@ -1,5 +1,5 @@
-// Read a list of reversed hostnames, separated by newlines. Print only those
-// that are rejected by the current policy.
+// Read a list of reversed FQDNs and/or normal IP addresses, separated by
+// newlines. Print only those that are rejected by the current policy.
 
 package notmain
 
@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/netip"
 	"os"
 
 	"github.com/letsencrypt/boulder/cmd"
+	"github.com/letsencrypt/boulder/identifier"
 	"github.com/letsencrypt/boulder/policy"
 	"github.com/letsencrypt/boulder/sa"
 )
@@ -22,7 +24,7 @@ func init() {
 
 func main() {
 	inputFilename := flag.String("input", "", "File containing a list of reversed hostnames to check, newline separated. Defaults to stdin")
-	policyFile := flag.String("policy", "test/hostname-policy.yaml", "File containing a hostname policy in yaml.")
+	policyFile := flag.String("policy", "test/ident-policy.yaml", "File containing an identifier policy in YAML.")
 	flag.Parse()
 
 	var input io.Reader
@@ -38,19 +40,26 @@ func main() {
 
 	scanner := bufio.NewScanner(input)
 	logger := cmd.NewLogger(cmd.SyslogConfig{StdoutLevel: 7})
-	logger.Info(cmd.VersionString())
-	pa, err := policy.New(nil, logger)
+	cmd.LogStartup(logger)
+	pa, err := policy.New(nil, nil, logger)
 	if err != nil {
 		log.Fatal(err)
 	}
-	err = pa.LoadHostnamePolicyFile(*policyFile)
+	err = pa.LoadIdentPolicyFile(*policyFile)
 	if err != nil {
 		log.Fatalf("reading %s: %s", *policyFile, err)
 	}
 	var errors bool
 	for scanner.Scan() {
-		n := sa.ReverseName(scanner.Text())
-		err := pa.WillingToIssue([]string{n})
+		n := sa.EncodeIssuedName(scanner.Text())
+		var ident identifier.ACMEIdentifier
+		ip, err := netip.ParseAddr(n)
+		if err == nil {
+			ident = identifier.NewIP(ip)
+		} else {
+			ident = identifier.NewDNS(n)
+		}
+		err = pa.WillingToIssue(identifier.ACMEIdentifiers{ident})
 		if err != nil {
 			errors = true
 			fmt.Printf("%s: %s\n", n, err)

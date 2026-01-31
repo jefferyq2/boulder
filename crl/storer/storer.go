@@ -18,6 +18,8 @@ import (
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/jmhodges/clock"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/letsencrypt/boulder/crl"
@@ -35,7 +37,7 @@ type simpleS3 interface {
 }
 
 type crlStorer struct {
-	cspb.UnimplementedCRLStorerServer
+	cspb.UnsafeCRLStorerServer
 	s3Client         simpleS3
 	s3Bucket         string
 	issuers          map[issuance.NameID]*issuance.Certificate
@@ -45,6 +47,8 @@ type crlStorer struct {
 	log              blog.Logger
 	clk              clock.Clock
 }
+
+var _ cspb.CRLStorerServer = (*crlStorer)(nil)
 
 func New(
 	issuers []*issuance.Certificate,
@@ -59,25 +63,22 @@ func New(
 		issuersByNameID[issuer.NameID()] = issuer
 	}
 
-	uploadCount := prometheus.NewCounterVec(prometheus.CounterOpts{
+	uploadCount := promauto.With(stats).NewCounterVec(prometheus.CounterOpts{
 		Name: "crl_storer_uploads",
 		Help: "A counter of the number of CRLs uploaded by crl-storer",
 	}, []string{"issuer", "result"})
-	stats.MustRegister(uploadCount)
 
-	sizeHistogram := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+	sizeHistogram := promauto.With(stats).NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "crl_storer_sizes",
 		Help:    "A histogram of the sizes (in bytes) of CRLs uploaded by crl-storer",
 		Buckets: []float64{0, 256, 1024, 4096, 16384, 65536},
 	}, []string{"issuer"})
-	stats.MustRegister(sizeHistogram)
 
-	latencyHistogram := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+	latencyHistogram := promauto.With(stats).NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "crl_storer_upload_times",
 		Help:    "A histogram of the time (in seconds) it took crl-storer to upload CRLs",
 		Buckets: []float64{0.01, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000},
 	}, []string{"issuer"})
-	stats.MustRegister(latencyHistogram)
 
 	return &crlStorer{
 		issuers:          issuersByNameID,
@@ -97,11 +98,13 @@ func New(
 // UploadCRL implements the gRPC method of the same name. It takes a stream of
 // bytes as its input, parses and runs some sanity checks on the CRL, and then
 // uploads it to S3.
-func (cs *crlStorer) UploadCRL(stream cspb.CRLStorer_UploadCRLServer) error {
+func (cs *crlStorer) UploadCRL(stream grpc.ClientStreamingServer[cspb.UploadCRLRequest, emptypb.Empty]) error {
 	var issuer *issuance.Certificate
 	var shardIdx int64
 	var crlNumber *big.Int
 	crlBytes := make([]byte, 0)
+	var cacheControl string
+	var expires time.Time
 
 	// Read all of the messages from the input stream.
 	for {
@@ -121,6 +124,9 @@ func (cs *crlStorer) UploadCRL(stream cspb.CRLStorer_UploadCRLServer) error {
 			if payload.Metadata.IssuerNameID == 0 || payload.Metadata.Number == 0 {
 				return errors.New("got incomplete metadata message")
 			}
+
+			cacheControl = payload.Metadata.CacheControl
+			expires = payload.Metadata.Expires.AsTime()
 
 			shardIdx = payload.Metadata.ShardIdx
 			crlNumber = crl.Number(time.Unix(0, payload.Metadata.Number))
@@ -226,6 +232,8 @@ func (cs *crlStorer) UploadCRL(stream cspb.CRLStorer_UploadCRLServer) error {
 		ChecksumSHA256:    &checksumb64,
 		ContentType:       &crlContentType,
 		Metadata:          map[string]string{"crlNumber": crlNumber.String()},
+		Expires:           &expires,
+		CacheControl:      &cacheControl,
 	})
 
 	latency := cs.clk.Now().Sub(start)
@@ -233,15 +241,18 @@ func (cs *crlStorer) UploadCRL(stream cspb.CRLStorer_UploadCRLServer) error {
 
 	if err != nil {
 		cs.uploadCount.WithLabelValues(issuer.Subject.CommonName, "failed").Inc()
-		cs.log.AuditErrf("CRL upload failed: id=[%s] err=[%s]", crlId, err)
+		cs.log.AuditErr("CRL upload failed", err, map[string]any{"id": crlId})
 		return fmt.Errorf("uploading to S3: %w", err)
 	}
 
 	cs.uploadCount.WithLabelValues(issuer.Subject.CommonName, "success").Inc()
-	cs.log.AuditInfof(
-		"CRL uploaded: id=[%s] issuerCN=[%s] thisUpdate=[%s] nextUpdate=[%s] numEntries=[%d]",
-		crlId, issuer.Subject.CommonName, crl.ThisUpdate, crl.NextUpdate, len(crl.RevokedCertificateEntries),
-	)
+	cs.log.AuditInfo("CRL uploaded", map[string]any{
+		"id":         crlId,
+		"issuerCN":   issuer.Subject.CommonName,
+		"thisUpdate": crl.ThisUpdate.Format(time.RFC3339),
+		"nextUpdate": crl.NextUpdate.Format(time.RFC3339),
+		"numEntries": len(crl.RevokedCertificateEntries),
+	})
 
 	return stream.SendAndClose(&emptypb.Empty{})
 }

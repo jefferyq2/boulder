@@ -6,23 +6,27 @@
 		"dnsProvider": {
 			"dnsAuthority": "consul.service.consul",
 			"srvLookup": {
-				"service": "dns",
+				"service": "doh",
 				"domain": "service.consul"
 			}
 		},
 		"dnsTimeout": "1s",
-		"dnsAllowLoopbackAddresses": true,
 		"issuerDomain": "happy-hacker-ca.invalid",
 		"tls": {
-			"caCertfile": "test/grpc-creds/minica.pem",
-			"certFile": "test/grpc-creds/rva.boulder/cert.pem",
-			"keyFile": "test/grpc-creds/rva.boulder/key.pem"
+			"caCertfile": "test/certs/ipki/minica.pem",
+			"certFile": "test/certs/ipki/rva.boulder/cert.pem",
+			"keyFile": "test/certs/ipki/rva.boulder/key.pem"
 		},
 		"grpc": {
 			"maxConnectionAge": "30s",
 			"address": ":9998",
 			"services": {
 				"va.VA": {
+					"clientNames": [
+						"va.boulder"
+					]
+				},
+				"va.CAA": {
 					"clientNames": [
 						"va.boulder"
 					]
@@ -34,11 +38,15 @@
 				}
 			}
 		},
-		"features": {},
+		"features": {
+			"DOH": true
+		},
 		"accountURIPrefixes": [
 			"http://boulder.service.consul:4000/acme/reg/",
 			"http://boulder.service.consul:4001/acme/acct/"
-		]
+		],
+		"perspective": "surrealist",
+		"rir": "RIPE"
 	},
 	"syslog": {
 		"stdoutlevel": 4,

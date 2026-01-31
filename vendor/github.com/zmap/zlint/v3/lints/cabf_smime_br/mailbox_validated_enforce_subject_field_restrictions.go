@@ -1,7 +1,7 @@
 package cabf_smime_br
 
 /*
- * ZLint Copyright 2021 Regents of the University of Michigan
+ * ZLint Copyright 2024 Regents of the University of Michigan
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not
  * use this file except in compliance with the License. You may obtain a copy
@@ -91,7 +91,7 @@ func (l *mailboxValidatedEnforceSubjectFieldRestrictions) Execute(c *x509.Certif
 				if fieldName, knownField := l.forbiddenSubjectFields[oidStr]; knownField {
 					return &lint.LintResult{Status: lint.Error, Details: fmt.Sprintf("subject DN contains forbidden field: %s (%s)", fieldName, oidStr)}
 				}
-				return &lint.LintResult{Status: lint.Error, Details: fmt.Sprintf("subject DN contains forbidden field: %s", oidStr)}
+				return &lint.LintResult{Status: lint.Error, Details: "subject DN contains forbidden field: " + oidStr}
 			}
 		}
 	}

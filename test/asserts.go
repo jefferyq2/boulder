@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -24,7 +25,7 @@ func Assert(t *testing.T, result bool, message string) {
 
 // AssertNil checks that an object is nil. Being a "boxed nil" (a nil value
 // wrapped in a non-nil interface type) is not good enough.
-func AssertNil(t *testing.T, obj interface{}, message string) {
+func AssertNil(t *testing.T, obj any, message string) {
 	t.Helper()
 	if obj != nil {
 		t.Fatal(message)
@@ -35,7 +36,7 @@ func AssertNil(t *testing.T, obj interface{}, message string) {
 // wrapped in a non-nil interface type) is not good enough.
 // Note that there is a gap between AssertNil and AssertNotNil. Both fail when
 // called with a boxed nil. This is intentional: we want to avoid boxed nils.
-func AssertNotNil(t *testing.T, obj interface{}, message string) {
+func AssertNotNil(t *testing.T, obj any, message string) {
 	t.Helper()
 	if obj == nil {
 		t.Fatal(message)
@@ -51,7 +52,7 @@ func AssertNotNil(t *testing.T, obj interface{}, message string) {
 
 // AssertBoxedNil checks that an inner object is nil. This is intentional for
 // testing purposes only.
-func AssertBoxedNil(t *testing.T, obj interface{}, message string) {
+func AssertBoxedNil(t *testing.T, obj any, message string) {
 	t.Helper()
 	typ := reflect.TypeOf(obj).Kind()
 	switch typ {
@@ -83,7 +84,7 @@ func AssertError(t *testing.T, err error, message string) {
 
 // AssertErrorWraps checks that err can be unwrapped into the given target.
 // NOTE: Has the side effect of actually performing that unwrapping.
-func AssertErrorWraps(t *testing.T, err error, target interface{}) {
+func AssertErrorWraps(t *testing.T, err error, target any) {
 	t.Helper()
 	if !errors.As(err, target) {
 		t.Fatalf("error does not wrap an error of the expected type: %q !> %+T", err.Error(), target)
@@ -104,7 +105,7 @@ func AssertErrorIs(t *testing.T, err error, target error) {
 }
 
 // AssertEquals uses the equality operator (==) to measure one and two
-func AssertEquals(t *testing.T, one interface{}, two interface{}) {
+func AssertEquals(t *testing.T, one any, two any) {
 	t.Helper()
 	if reflect.TypeOf(one) != reflect.TypeOf(two) {
 		t.Fatalf("cannot test equality of different types: %T != %T", one, two)
@@ -115,7 +116,7 @@ func AssertEquals(t *testing.T, one interface{}, two interface{}) {
 }
 
 // AssertDeepEquals uses the reflect.DeepEqual method to measure one and two
-func AssertDeepEquals(t *testing.T, one interface{}, two interface{}) {
+func AssertDeepEquals(t *testing.T, one any, two any) {
 	t.Helper()
 	if !reflect.DeepEqual(one, two) {
 		t.Fatalf("[%#v] !(deep)= [%#v]", one, two)
@@ -124,7 +125,7 @@ func AssertDeepEquals(t *testing.T, one interface{}, two interface{}) {
 
 // AssertMarshaledEquals marshals one and two to JSON, and then uses
 // the equality operator to measure them
-func AssertMarshaledEquals(t *testing.T, one interface{}, two interface{}) {
+func AssertMarshaledEquals(t *testing.T, one any, two any) {
 	t.Helper()
 	oneJSON, err := json.Marshal(one)
 	AssertNotError(t, err, "Could not marshal 1st argument")
@@ -141,13 +142,13 @@ func AssertMarshaledEquals(t *testing.T, one interface{}, two interface{}) {
 // the same
 func AssertUnmarshaledEquals(t *testing.T, got, expected string) {
 	t.Helper()
-	var gotMap, expectedMap map[string]interface{}
+	var gotMap, expectedMap map[string]any
 	err := json.Unmarshal([]byte(got), &gotMap)
 	AssertNotError(t, err, "Could not unmarshal 'got'")
 	err = json.Unmarshal([]byte(expected), &expectedMap)
 	AssertNotError(t, err, "Could not unmarshal 'expected'")
 	if len(gotMap) != len(expectedMap) {
-		t.Errorf("Expected had %d keys, got had %d", len(gotMap), len(expectedMap))
+		t.Errorf("Expected %d keys, but got %d", len(expectedMap), len(gotMap))
 	}
 	for k, v := range expectedMap {
 		if !reflect.DeepEqual(v, gotMap[k]) {
@@ -158,7 +159,7 @@ func AssertUnmarshaledEquals(t *testing.T, got, expected string) {
 
 // AssertNotEquals uses the equality operator to measure that one and two
 // are different
-func AssertNotEquals(t *testing.T, one interface{}, two interface{}) {
+func AssertNotEquals(t *testing.T, one any, two any) {
 	t.Helper()
 	if one == two {
 		t.Fatalf("%#v == %#v", one, two)
@@ -194,10 +195,8 @@ func AssertNotContains(t *testing.T, haystack string, needle string) {
 // AssertSliceContains determines if needle can be found in haystack
 func AssertSliceContains[T comparable](t *testing.T, haystack []T, needle T) {
 	t.Helper()
-	for _, item := range haystack {
-		if item == needle {
-			return
-		}
+	if slices.Contains(haystack, needle) {
+		return
 	}
 	t.Fatalf("Slice %v does not contain %v", haystack, needle)
 }
@@ -247,46 +246,57 @@ loop:
 			total += float64(iom.Histogram.GetSampleCount())
 		}
 	}
-	AssertEquals(t, total, expected)
+	if total != expected {
+		t.Errorf("metric with labels %+v: got %g, want %g", l, total, expected)
+	}
 }
 
-// AssertImplementsGRPCServer guarantees that impl, which must be a pointer to one of our
-// gRPC service implementation types, implements all of the methods expected by
-// unimpl, which must be the auto-generated gRPC type which is embedded by impl.
-// This function incidentally also guarantees that impl does not have any
-// methods with non-pointer receivers.
-func AssertImplementsGRPCServer(t *testing.T, impl any, unimpl any) {
-	// This type is auto-generated by grpc-go, and has methods which implement
-	// the auto-generated gRPC interface. These methods all have value receivers,
-	// not pointer receivers, so we're not using a pointer type here.
-	unimplType := reflect.TypeOf(unimpl)
-
-	// This is the type we use to manually implement the same auto-generated gRPC
-	// interface. We implement all of our methods with pointer receivers. This
-	// type is required to embed the auto-generated "unimplemented" type above,
-	// so it inherits all of the methods implemented by that type as well. But
-	// we can use the fact that we use pointer receivers while the auto-generated
-	// type uses value receivers to our advantage.
-	implType := reflect.TypeOf(impl).Elem()
-
-	// Iterate over all of the methods which are provided by a *non-pointer*
-	// receiver of our type. These will be only the methods which we *don't*
-	// manually implement ourselves, because when we implement the method ourself
-	// we use a pointer receiver. So this loop will only iterate over those
-	// methods which "fall through" to the embedded "unimplemented" type. Ideally,
-	// this loop executes zero times. If there are any methods at all on the
-	// non-pointer receiver, something has gone wrong.
-	for i := range implType.NumMethod() {
-		method := implType.Method(i)
-		_, ok := unimplType.MethodByName(method.Name)
-		if ok {
-			// If the lookup worked, then we know this is a method which we were
-			// supposed to implement, but didn't. Oops.
-			t.Errorf("%s does not implement method %s", implType.Name(), method.Name)
-		} else {
-			// If the lookup failed, then we have accidentally implemented some other
-			// method with a non-pointer receiver. We probably didn't mean to do that.
-			t.Errorf("%s.%s has non-pointer receiver", implType.Name(), method.Name)
+// AssertHistogramBucketCount is similar to AssertMetricWithLabelsEquals, in
+// that it determines whether the number of samples within a given histogram
+// bucket matches the expectation. The bucket to check is indicated by a single
+// exemplar value; whichever bucket that value falls into is the bucket whose
+// sample count will be compared to the expected value.
+func AssertHistogramBucketCount(t *testing.T, c prometheus.Collector, l prometheus.Labels, b float64, expected uint64) {
+	t.Helper()
+	ch := make(chan prometheus.Metric)
+	done := make(chan struct{})
+	go func() {
+		c.Collect(ch)
+		close(done)
+	}()
+	var total uint64
+	timeout := time.After(time.Second)
+loop:
+	for {
+	metric:
+		select {
+		case <-timeout:
+			t.Fatal("timed out collecting metrics")
+		case <-done:
+			break loop
+		case m := <-ch:
+			var iom io_prometheus_client.Metric
+			_ = m.Write(&iom)
+			for _, lp := range iom.Label {
+				// If any of the labels on this metric have the same name as but
+				// different value than a label in `l`, skip this metric.
+				val, ok := l[lp.GetName()]
+				if ok && lp.GetValue() != val {
+					break metric
+				}
+			}
+			lowerBucketsCount := uint64(0)
+			for _, bucket := range iom.Histogram.Bucket {
+				if b <= bucket.GetUpperBound() {
+					total += bucket.GetCumulativeCount() - lowerBucketsCount
+					break
+				} else {
+					lowerBucketsCount += bucket.GetCumulativeCount()
+				}
+			}
 		}
+	}
+	if total != expected {
+		t.Errorf("histogram with labels %+v at bucket %g: got %d, want %d", l, b, total, expected)
 	}
 }

@@ -27,17 +27,21 @@ func TestChallenges(t *testing.T) {
 
 	token := NewToken()
 	http01 := HTTPChallenge01(token)
-	test.AssertNotError(t, http01.CheckConsistencyForClientOffer(), "CheckConsistencyForClientOffer returned an error")
+	test.AssertNotError(t, http01.CheckPending(), "CheckConsistencyForClientOffer returned an error")
 
 	dns01 := DNSChallenge01(token)
-	test.AssertNotError(t, dns01.CheckConsistencyForClientOffer(), "CheckConsistencyForClientOffer returned an error")
+	test.AssertNotError(t, dns01.CheckPending(), "CheckConsistencyForClientOffer returned an error")
+
+	dnsAccount01 := DNSAccountChallenge01(token)
+	test.AssertNotError(t, dnsAccount01.CheckPending(), "CheckConsistencyForClientOffer returned an error")
 
 	tlsalpn01 := TLSALPNChallenge01(token)
-	test.AssertNotError(t, tlsalpn01.CheckConsistencyForClientOffer(), "CheckConsistencyForClientOffer returned an error")
+	test.AssertNotError(t, tlsalpn01.CheckPending(), "CheckConsistencyForClientOffer returned an error")
 
 	test.Assert(t, ChallengeTypeHTTP01.IsValid(), "Refused valid challenge")
 	test.Assert(t, ChallengeTypeDNS01.IsValid(), "Refused valid challenge")
 	test.Assert(t, ChallengeTypeTLSALPN01.IsValid(), "Refused valid challenge")
+	test.Assert(t, ChallengeTypeDNSAccount01.IsValid(), "Refused valid challenge")
 	test.Assert(t, !AcmeChallenge("nonsense-71").IsValid(), "Accepted invalid challenge")
 }
 

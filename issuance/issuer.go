@@ -11,10 +11,10 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/jmhodges/clock"
-	"golang.org/x/crypto/ocsp"
 
 	"github.com/letsencrypt/boulder/core"
 	"github.com/letsencrypt/boulder/linter"
@@ -44,21 +44,10 @@ func IssuerNameID(ee *x509.Certificate) NameID {
 	return truncatedHash(ee.RawIssuer)
 }
 
-// ResponderNameID returns the NameID (a truncated hash over the raw
-// bytes of the Responder Distinguished Name) of the given OCSP Response.
-// As per the OCSP spec, it is technically possible for this field to not be
-// populated: the OCSP Response can instead contain a SHA-1 hash of the Issuer
-// Public Key as the Responder ID. However, all OCSP responses that we produce
-// contain it, because the Go stdlib always includes it.
-func ResponderNameID(resp *ocsp.Response) NameID {
-	return truncatedHash(resp.RawResponderName)
-}
-
 // truncatedHash computes a truncated SHA1 hash across arbitrary bytes. Uses
 // SHA1 because that is the algorithm most commonly used in OCSP requests.
 // PURPOSEFULLY NOT EXPORTED. Exists only to ensure that the implementations of
-// SubjectNameID(), IssuerNameID(), and ResponderNameID never diverge. Use those
-// instead.
+// SubjectNameID() and IssuerNameID() never diverge. Use those instead.
 func truncatedHash(name []byte) NameID {
 	h := crypto.SHA1.New()
 	h.Write(name)
@@ -152,33 +141,25 @@ func LoadChain(certFiles []string) ([]*Certificate, error) {
 
 // IssuerConfig describes the constraints on and URLs used by a single issuer.
 type IssuerConfig struct {
-	// Active determines if the issuer can be used to sign precertificates. All
-	// issuers, regardless of this field, can be used to sign final certificates
-	// (for which an issuance token is presented), OCSP responses, and CRLs.
-	// All Active issuers of a given key type (RSA or ECDSA) are part of a pool
-	// and each precertificate will be issued randomly from a selected pool.
-	// The selection of which pool depends on the precertificate's key algorithm,
-	// the ECDSAForAll feature flag, and the ECDSAAllowListFilename config field.
+	// Deprecated: Populate IssuerConfig.Profiles to ensure "Active"
 	Active bool
 
-	// UseForRSALeaves is a synonym for Active. Note that, despite the name,
-	// setting this field to true cannot add an issuer to a pool different than
-	// its key type. An active issuer will always be part of a pool based on its
-	// key type.
-	//
-	// Deprecated: use Active instead.
-	UseForRSALeaves bool
-	// UseForECDSALeaves is a synonym for Active. Note that, despite the name,
-	// setting this field to true cannot add an issuer to a pool different than
-	// its key type. An active issuer will always be part of a pool based on its
-	// key type.
-	//
-	// Deprecated: use Active instead.
-	UseForECDSALeaves bool
+	// Profiles is the list of profiles for which this issuer is willing to issue.
+	// The names listed here must match the names of configured profiles (see
+	// cmd/ca/main.go's Config.Issuance.CertProfiles and issuance/cert.go's
+	// ProfileConfig). If Profiles is not empty then the issuer can be used
+	// to sign precertificates and final certificates. All issuers, regardless
+	// if this field is empty or not, can be used to sign CRLs. All issuers
+	// with a profile(s) of a given key type (RSA or ECDSA) are part of a pool
+	// and each precertificate will be issued randomly from a selected pool.
+	// The selection of which pool depends on the precertificate's key algorithm.
+	Profiles []string `validate:"dive,alphanum,min=1,max=32"`
 
 	IssuerURL  string `validate:"required,url"`
-	OCSPURL    string `validate:"required,url"`
-	CRLURLBase string `validate:"omitempty,url,startswith=http://,endswith=/"`
+	CRLURLBase string `validate:"required,url,startswith=http://,endswith=/"`
+
+	// Number of CRL shards. Must be positive, but can be 1 for no sharding.
+	CRLShards int `validate:"required,min=1"`
 
 	Location IssuerLoc
 }
@@ -211,17 +192,19 @@ type Issuer struct {
 
 	keyAlg x509.PublicKeyAlgorithm
 	sigAlg x509.SignatureAlgorithm
-	active bool
 
 	// Used to set the Authority Information Access caIssuers URL in issued
 	// certificates.
 	issuerURL string
-	// Used to set the Authority Information Access ocsp URL in issued
-	// certificates.
-	ocspURL string
 	// Used to set the Issuing Distribution Point extension in issued CRLs
-	// *and* (eventually) the CRL Distribution Point extension in issued certs.
+	// and the CRL Distribution Point extension in issued certs.
 	crlURLBase string
+
+	crlShards int
+
+	// profiles is a list of the names of profiles that this issuer is willing to
+	// issue for.
+	profiles []string
 
 	clk clock.Clock
 }
@@ -250,19 +233,19 @@ func newIssuer(config IssuerConfig, cert *Certificate, signer crypto.Signer, clk
 	}
 
 	if config.IssuerURL == "" {
-		return nil, errors.New("Issuer URL is required")
-	}
-	if config.OCSPURL == "" {
-		return nil, errors.New("OCSP URL is required")
+		return nil, errors.New("issuer URL is required")
 	}
 	if config.CRLURLBase == "" {
-		return nil, errors.New("CRL URL base is required")
+		return nil, errors.New("crlURLBase is required")
 	}
 	if !strings.HasPrefix(config.CRLURLBase, "http://") {
 		return nil, fmt.Errorf("crlURLBase must use HTTP scheme, got %q", config.CRLURLBase)
 	}
 	if !strings.HasSuffix(config.CRLURLBase, "/") {
 		return nil, fmt.Errorf("crlURLBase must end with exactly one forward slash, got %q", config.CRLURLBase)
+	}
+	if config.CRLShards <= 0 {
+		return nil, errors.New("number of CRL shards is required")
 	}
 
 	// We require that all of our issuers be capable of both issuing certs and
@@ -288,10 +271,10 @@ func newIssuer(config IssuerConfig, cert *Certificate, signer crypto.Signer, clk
 		Linter:     lintSigner,
 		keyAlg:     keyAlg,
 		sigAlg:     sigAlg,
-		active:     config.Active || config.UseForRSALeaves || config.UseForECDSALeaves,
 		issuerURL:  config.IssuerURL,
-		ocspURL:    config.OCSPURL,
 		crlURLBase: config.CRLURLBase,
+		crlShards:  config.CRLShards,
+		profiles:   config.Profiles,
 		clk:        clk,
 	}
 	return i, nil
@@ -305,9 +288,9 @@ func (i *Issuer) KeyType() x509.PublicKeyAlgorithm {
 }
 
 // IsActive is true if the issuer is willing to issue precertificates, and false
-// if the issuer is only willing to issue final certificates, OCSP, and CRLs.
+// if the issuer is only willing to issue final certificates and CRLs.
 func (i *Issuer) IsActive() bool {
-	return i.active
+	return len(i.profiles) > 0
 }
 
 // Name provides the Common Name specified in the issuer's certificate.
@@ -318,6 +301,11 @@ func (i *Issuer) Name() string {
 // NameID provides the NameID of the issuer's certificate.
 func (i *Issuer) NameID() NameID {
 	return i.Cert.NameID()
+}
+
+// Profiles returns the set of profiles that this issuer can issue for.
+func (i *Issuer) Profiles() []string {
+	return slices.Clone(i.profiles)
 }
 
 // LoadIssuer constructs a new Issuer, loading its certificate from disk and its

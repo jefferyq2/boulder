@@ -4,24 +4,24 @@
 			"dbConnectFile": "test/secrets/cert_checker_dburl",
 			"maxOpenConns": 10
 		},
-		"hostnamePolicyFile": "test/hostname-policy.yaml",
-		"goodkey": {
-			"fermatRounds": 100
-		},
+		"hostnamePolicyFile": "test/ident-policy.yaml",
 		"workers": 16,
 		"unexpiredOnly": true,
 		"badResultsOnly": true,
 		"checkPeriod": "72h",
 		"acceptableValidityDurations": [
-			"7776000s"
+			"7776000s",
+			"160h"
 		],
+		"lintConfig": "test/config-next/zlint.toml",
 		"ignoredLints": [
+			"w_ext_subject_key_identifier_missing_sub_cert",
 			"w_subject_common_name_included",
-			"w_sub_cert_aia_contains_internal_names"
+			"e_dnsname_not_valid_tld",
+			"w_ext_subject_key_identifier_not_recommended_subscriber"
 		],
 		"ctLogListFile": "test/ct-test-srv/log_list.json",
 		"features": {
-			"CertCheckerRequiresCorrespondence": true,
 			"CertCheckerChecksValidations": true,
 			"CertCheckerRequiresValidations": true
 		}
@@ -31,6 +31,10 @@
 			"http-01": true,
 			"dns-01": true,
 			"tls-alpn-01": true
+		},
+		"identifiers": {
+			"dns": true,
+			"ip": true
 		}
 	},
 	"syslog": {

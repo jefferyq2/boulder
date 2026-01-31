@@ -1,21 +1,27 @@
 package core
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
+	"net/netip"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/letsencrypt/boulder/identifier"
 	"github.com/letsencrypt/boulder/test"
 )
 
@@ -39,9 +45,9 @@ func TestNewToken(t *testing.T) {
 }
 
 func TestLooksLikeAToken(t *testing.T) {
-	test.Assert(t, !LooksLikeAToken("R-UL_7MrV3tUUjO9v5ym2srK3dGGCwlxbVyKBdwLOS"), "Accepted short token")
-	test.Assert(t, !LooksLikeAToken("R-UL_7MrV3tUUjO9v5ym2srK3dGGCwlxbVyKBdwLOS%"), "Accepted invalid token")
-	test.Assert(t, LooksLikeAToken("R-UL_7MrV3tUUjO9v5ym2srK3dGGCwlxbVyKBdwLOSU"), "Rejected valid token")
+	test.Assert(t, !looksLikeAToken("R-UL_7MrV3tUUjO9v5ym2srK3dGGCwlxbVyKBdwLOS"), "Accepted short token")
+	test.Assert(t, !looksLikeAToken("R-UL_7MrV3tUUjO9v5ym2srK3dGGCwlxbVyKBdwLOS%"), "Accepted invalid token")
+	test.Assert(t, looksLikeAToken("R-UL_7MrV3tUUjO9v5ym2srK3dGGCwlxbVyKBdwLOSU"), "Rejected valid token")
 }
 
 func TestSerialUtils(t *testing.T) {
@@ -187,7 +193,7 @@ func BenchmarkIsAnyNilOrZero(b *testing.B) {
 	var thyme *time.Time
 	var sage *time.Duration
 	var table = []struct {
-		input interface{}
+		input any
 	}{
 		{input: int(0)},
 		{input: int(1)},
@@ -237,7 +243,7 @@ func BenchmarkIsAnyNilOrZero(b *testing.B) {
 
 	for _, v := range table {
 		b.Run(fmt.Sprintf("input_%T_%v", v.input, v.input), func(b *testing.B) {
-			for range b.N {
+			for b.Loop() {
 				_ = IsAnyNilOrZero(v.input)
 			}
 		})
@@ -272,16 +278,16 @@ func TestLoadCert(t *testing.T) {
 	test.AssertError(t, err, "Loading nonexistent path did not error")
 	test.AssertErrorWraps(t, err, &osPathErr)
 
-	_, err = LoadCert("../test/test-ca.der")
+	_, err = LoadCert("../test/hierarchy/README.md")
 	test.AssertError(t, err, "Loading non-PEM file did not error")
-	test.AssertEquals(t, err.Error(), "no data in cert PEM file \"../test/test-ca.der\"")
+	test.AssertContains(t, err.Error(), "no data in cert PEM file")
 
 	_, err = LoadCert("../test/hierarchy/int-e1.key.pem")
-	test.AssertError(t, err, "Loading non-cert file did not error")
-	test.AssertEquals(t, err.Error(), "x509: malformed tbs certificate")
+	test.AssertError(t, err, "Loading non-cert PEM file did not error")
+	test.AssertContains(t, err.Error(), "x509: malformed tbs certificate")
 
 	cert, err := LoadCert("../test/hierarchy/int-r3.cert.pem")
-	test.AssertNotError(t, err, "Failed to load cert file")
+	test.AssertNotError(t, err, "Failed to load cert PEM file")
 	test.AssertEquals(t, cert.Subject.CommonName, "(TEST) Radical Rhino R3")
 }
 
@@ -315,29 +321,108 @@ func TestRetryBackoff(t *testing.T) {
 
 }
 
-func TestHashNames(t *testing.T) {
-	// Test that it is deterministic
-	h1 := HashNames([]string{"a"})
-	h2 := HashNames([]string{"a"})
-	test.AssertByteEquals(t, h1, h2)
+func TestHashIdentifiers(t *testing.T) {
+	dns1 := identifier.NewDNS("example.com")
+	dns1_caps := identifier.NewDNS("eXaMpLe.COM")
+	dns2 := identifier.NewDNS("high-energy-cheese-lab.nrc-cnrc.gc.ca")
+	dns2_caps := identifier.NewDNS("HIGH-ENERGY-CHEESE-LAB.NRC-CNRC.GC.CA")
+	ipv4_1 := identifier.NewIP(netip.MustParseAddr("10.10.10.10"))
+	ipv4_2 := identifier.NewIP(netip.MustParseAddr("172.16.16.16"))
+	ipv6_1 := identifier.NewIP(netip.MustParseAddr("2001:0db8:0bad:0dab:c0ff:fee0:0007:1337"))
+	ipv6_2 := identifier.NewIP(netip.MustParseAddr("3fff::"))
 
-	// Test that it differentiates
-	h1 = HashNames([]string{"a"})
-	h2 = HashNames([]string{"b"})
-	test.Assert(t, !bytes.Equal(h1, h2), "Should have been different")
+	testCases := []struct {
+		Name          string
+		Idents1       identifier.ACMEIdentifiers
+		Idents2       identifier.ACMEIdentifiers
+		ExpectedEqual bool
+	}{
+		{
+			Name:          "Deterministic for DNS",
+			Idents1:       identifier.ACMEIdentifiers{dns1},
+			Idents2:       identifier.ACMEIdentifiers{dns1},
+			ExpectedEqual: true,
+		},
+		{
+			Name:          "Deterministic for IPv4",
+			Idents1:       identifier.ACMEIdentifiers{ipv4_1},
+			Idents2:       identifier.ACMEIdentifiers{ipv4_1},
+			ExpectedEqual: true,
+		},
+		{
+			Name:          "Deterministic for IPv6",
+			Idents1:       identifier.ACMEIdentifiers{ipv6_1},
+			Idents2:       identifier.ACMEIdentifiers{ipv6_1},
+			ExpectedEqual: true,
+		},
+		{
+			Name:          "Differentiates for DNS",
+			Idents1:       identifier.ACMEIdentifiers{dns1},
+			Idents2:       identifier.ACMEIdentifiers{dns2},
+			ExpectedEqual: false,
+		},
+		{
+			Name:          "Differentiates for IPv4",
+			Idents1:       identifier.ACMEIdentifiers{ipv4_1},
+			Idents2:       identifier.ACMEIdentifiers{ipv4_2},
+			ExpectedEqual: false,
+		},
+		{
+			Name:          "Differentiates for IPv6",
+			Idents1:       identifier.ACMEIdentifiers{ipv6_1},
+			Idents2:       identifier.ACMEIdentifiers{ipv6_2},
+			ExpectedEqual: false,
+		},
+		{
+			Name: "Not subject to ordering",
+			Idents1: identifier.ACMEIdentifiers{
+				dns1, dns2, ipv4_1, ipv4_2, ipv6_1, ipv6_2,
+			},
+			Idents2: identifier.ACMEIdentifiers{
+				ipv6_1, dns2, ipv4_2, dns1, ipv4_1, ipv6_2,
+			},
+			ExpectedEqual: true,
+		},
+		{
+			Name: "Not case sensitive",
+			Idents1: identifier.ACMEIdentifiers{
+				dns1, dns2,
+			},
+			Idents2: identifier.ACMEIdentifiers{
+				dns1_caps, dns2_caps,
+			},
+			ExpectedEqual: true,
+		},
+		{
+			Name: "Not subject to duplication",
+			Idents1: identifier.ACMEIdentifiers{
+				dns1, dns1,
+			},
+			Idents2:       identifier.ACMEIdentifiers{dns1},
+			ExpectedEqual: true,
+		},
+	}
 
-	// Test that it is not subject to ordering
-	h1 = HashNames([]string{"a", "b"})
-	h2 = HashNames([]string{"b", "a"})
-	test.AssertByteEquals(t, h1, h2)
+	for _, tc := range testCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			t.Parallel()
+			h1 := HashIdentifiers(tc.Idents1)
+			h2 := HashIdentifiers(tc.Idents2)
+			if slices.Equal(h1, h2) != tc.ExpectedEqual {
+				t.Errorf("Comparing hashes of idents %#v and %#v, expected equality to be %v", tc.Idents1, tc.Idents2, tc.ExpectedEqual)
+			}
+		})
+	}
+}
 
-	// Test that it is not subject to case
-	h1 = HashNames([]string{"a", "b"})
-	h2 = HashNames([]string{"A", "B"})
-	test.AssertByteEquals(t, h1, h2)
-
-	// Test that it is not subject to duplication
-	h1 = HashNames([]string{"a", "a"})
-	h2 = HashNames([]string{"a"})
-	test.AssertByteEquals(t, h1, h2)
+func TestIsCanceled(t *testing.T) {
+	if !IsCanceled(context.Canceled) {
+		t.Errorf("Expected context.Canceled to be canceled, but wasn't.")
+	}
+	if !IsCanceled(status.Errorf(codes.Canceled, "hi")) {
+		t.Errorf("Expected gRPC cancellation to be canceled, but wasn't.")
+	}
+	if IsCanceled(errors.New("hi")) {
+		t.Errorf("Expected random error to not be canceled, but was.")
+	}
 }

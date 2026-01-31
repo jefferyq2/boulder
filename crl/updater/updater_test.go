@@ -1,7 +1,9 @@
 package updater
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"testing"
@@ -12,29 +14,30 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/jmhodges/clock"
+	"github.com/prometheus/client_golang/prometheus"
+
 	capb "github.com/letsencrypt/boulder/ca/proto"
 	corepb "github.com/letsencrypt/boulder/core/proto"
 	cspb "github.com/letsencrypt/boulder/crl/storer/proto"
 	"github.com/letsencrypt/boulder/issuance"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
-	"github.com/letsencrypt/boulder/mocks"
+	"github.com/letsencrypt/boulder/revocation"
 	sapb "github.com/letsencrypt/boulder/sa/proto"
 	"github.com/letsencrypt/boulder/test"
-	"github.com/prometheus/client_golang/prometheus"
 )
 
-// fakeGRCC is a fake sapb.StorageAuthority_GetRevokedCertsClient which can be
+// revokedCertsStream is a fake grpc.ClientStreamingClient which can be
 // populated with some CRL entries or an error for use as the return value of
-// a faked GetRevokedCerts call.
-type fakeGRCC struct {
+// a faked GetRevokedCertsByShard call.
+type revokedCertsStream struct {
 	grpc.ClientStream
 	entries []*corepb.CRLEntry
 	nextIdx int
 	err     error
 }
 
-func (f *fakeGRCC) Recv() (*corepb.CRLEntry, error) {
+func (f *revokedCertsStream) Recv() (*corepb.CRLEntry, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -47,21 +50,18 @@ func (f *fakeGRCC) Recv() (*corepb.CRLEntry, error) {
 }
 
 // fakeSAC is a fake sapb.StorageAuthorityClient which can be populated with a
-// fakeGRCC to be used as the return value for calls to GetRevokedCerts, and a
-// fake timestamp to serve as the database's maximum notAfter value.
+// fakeGRCC to be used as the return value for calls to GetRevokedCertsByShard,
+// and a fake timestamp to serve as the database's maximum notAfter value.
 type fakeSAC struct {
-	mocks.StorageAuthority
-	grcc        fakeGRCC
-	maxNotAfter time.Time
-	leaseError  error
+	sapb.StorageAuthorityClient
+	revokedCerts revokedCertsStream
+	maxNotAfter  time.Time
+	leaseError   error
 }
 
-func (f *fakeSAC) GetRevokedCerts(ctx context.Context, _ *sapb.GetRevokedCertsRequest, _ ...grpc.CallOption) (sapb.StorageAuthority_GetRevokedCertsClient, error) {
-	return &f.grcc, nil
-}
-
-func (f *fakeSAC) GetMaxExpiration(_ context.Context, req *emptypb.Empty, _ ...grpc.CallOption) (*timestamppb.Timestamp, error) {
-	return timestamppb.New(f.maxNotAfter), nil
+// Return the configured stream.
+func (f *fakeSAC) GetRevokedCertsByShard(ctx context.Context, req *sapb.GetRevokedCertsByShardRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[corepb.CRLEntry], error) {
+	return &f.revokedCerts, nil
 }
 
 func (f *fakeSAC) LeaseCRLShard(_ context.Context, req *sapb.LeaseCRLShardRequest, _ ...grpc.CallOption) (*sapb.LeaseCRLShardResponse, error) {
@@ -71,10 +71,20 @@ func (f *fakeSAC) LeaseCRLShard(_ context.Context, req *sapb.LeaseCRLShardReques
 	return &sapb.LeaseCRLShardResponse{IssuerNameID: req.IssuerNameID, ShardIdx: req.MinShardIdx}, nil
 }
 
-// fakeGCC is a fake capb.CRLGenerator_GenerateCRLClient which can be
-// populated with some CRL entries or an error for use as the return value of
-// a faked GenerateCRL call.
-type fakeGCC struct {
+// generateCRLStream implements the streaming API returned from GenerateCRL.
+//
+// Specifically it implements grpc.BidiStreamingClient.
+//
+// If it has non-nil error fields, it returns those on Send() or Recv().
+//
+// When it receives a CRL entry (on Send()), it records that entry internally, JSON serialized,
+// with a newline between JSON objects.
+//
+// When it is asked for bytes of a signed CRL (Recv()), it sends those JSON serialized contents.
+//
+// We use JSON instead of CRL format because we're not testing the signing and formatting done
+// by the CA, just the plumbing of different components together done by the crl-updater.
+type generateCRLStream struct {
 	grpc.ClientStream
 	chunks  [][]byte
 	nextIdx int
@@ -82,15 +92,36 @@ type fakeGCC struct {
 	recvErr error
 }
 
-func (f *fakeGCC) Send(*capb.GenerateCRLRequest) error {
+type crlEntry struct {
+	Serial    string
+	Reason    int32
+	RevokedAt time.Time
+}
+
+func (f *generateCRLStream) Send(req *capb.GenerateCRLRequest) error {
+	if f.sendErr != nil {
+		return f.sendErr
+	}
+	if t, ok := req.Payload.(*capb.GenerateCRLRequest_Entry); ok {
+		jsonBytes, err := json.Marshal(crlEntry{
+			Serial:    t.Entry.Serial,
+			Reason:    t.Entry.Reason,
+			RevokedAt: t.Entry.RevokedAt.AsTime(),
+		})
+		if err != nil {
+			return err
+		}
+		f.chunks = append(f.chunks, jsonBytes)
+		f.chunks = append(f.chunks, []byte("\n"))
+	}
 	return f.sendErr
 }
 
-func (f *fakeGCC) CloseSend() error {
+func (f *generateCRLStream) CloseSend() error {
 	return nil
 }
 
-func (f *fakeGCC) Recv() (*capb.GenerateCRLResponse, error) {
+func (f *generateCRLStream) Recv() (*capb.GenerateCRLResponse, error) {
 	if f.recvErr != nil {
 		return nil, f.recvErr
 	}
@@ -102,43 +133,67 @@ func (f *fakeGCC) Recv() (*capb.GenerateCRLResponse, error) {
 	return nil, io.EOF
 }
 
-// fakeCGC is a fake capb.CRLGeneratorClient which can be populated with a
-// fakeGCC to be used as the return value for calls to GenerateCRL.
-type fakeCGC struct {
-	gcc fakeGCC
+// fakeCA acts as a fake CA (specifically implementing capb.CRLGeneratorClient).
+//
+// It always returns its field in response to `GenerateCRL`. Because this is a streaming
+// RPC, that return value is responsible for most of the work.
+type fakeCA struct {
+	gcc generateCRLStream
 }
 
-func (f *fakeCGC) GenerateCRL(ctx context.Context, opts ...grpc.CallOption) (capb.CRLGenerator_GenerateCRLClient, error) {
+func (f *fakeCA) GenerateCRL(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[capb.GenerateCRLRequest, capb.GenerateCRLResponse], error) {
 	return &f.gcc, nil
 }
 
-// fakeUCC is a fake cspb.CRLStorer_UploadCRLClient which can be populated with
+// recordingUploader acts as the streaming part of UploadCRL.
+//
+// Records all uploaded chunks in crlBody.
+type recordingUploader struct {
+	grpc.ClientStream
+
+	crlBody []byte
+}
+
+func (r *recordingUploader) Send(req *cspb.UploadCRLRequest) error {
+	if t, ok := req.Payload.(*cspb.UploadCRLRequest_CrlChunk); ok {
+		r.crlBody = append(r.crlBody, t.CrlChunk...)
+	}
+	return nil
+}
+
+func (r *recordingUploader) CloseAndRecv() (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, nil
+}
+
+// noopUploader is a fake grpc.ClientStreamingClient which can be populated with
 // an error for use as the return value of a faked UploadCRL call.
-type fakeUCC struct {
+//
+// It does nothing with uploaded contents.
+type noopUploader struct {
 	grpc.ClientStream
 	sendErr error
 	recvErr error
 }
 
-func (f *fakeUCC) Send(*cspb.UploadCRLRequest) error {
+func (f *noopUploader) Send(*cspb.UploadCRLRequest) error {
 	return f.sendErr
 }
 
-func (f *fakeUCC) CloseAndRecv() (*emptypb.Empty, error) {
+func (f *noopUploader) CloseAndRecv() (*emptypb.Empty, error) {
 	if f.recvErr != nil {
 		return nil, f.recvErr
 	}
 	return &emptypb.Empty{}, nil
 }
 
-// fakeCSC is a fake cspb.CRLStorerClient which can be populated with a
-// fakeUCC for use as the return value for calls to UploadCRL.
-type fakeCSC struct {
-	ucc fakeUCC
+// fakeStorer is a fake cspb.CRLStorerClient which can be populated with an
+// uploader stream for use as the return value for calls to UploadCRL.
+type fakeStorer struct {
+	uploaderStream grpc.ClientStreamingClient[cspb.UploadCRLRequest, emptypb.Empty]
 }
 
-func (f *fakeCSC) UploadCRL(ctx context.Context, opts ...grpc.CallOption) (cspb.CRLStorer_UploadCRLClient, error) {
-	return &f.ucc, nil
+func (f *fakeStorer) UploadCRL(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[cspb.UploadCRLRequest, emptypb.Empty], error) {
+	return f.uploaderStream, nil
 }
 
 func TestUpdateShard(t *testing.T) {
@@ -152,24 +207,104 @@ func TestUpdateShard(t *testing.T) {
 	defer cancel()
 
 	clk := clock.NewFake()
-	clk.Set(time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC))
+	clk.Set(time.Date(2020, time.January, 18, 0, 0, 0, 0, time.UTC))
 	cu, err := NewUpdater(
 		[]*issuance.Certificate{e1, r3},
-		2, 18*time.Hour, 24*time.Hour,
-		6*time.Hour, time.Minute, 1, 1,
-		&fakeSAC{grcc: fakeGRCC{}, maxNotAfter: clk.Now().Add(90 * 24 * time.Hour)},
-		&fakeCGC{gcc: fakeGCC{}},
-		&fakeCSC{ucc: fakeUCC{}},
+		2,
+		18*time.Hour, // shardWidth
+		24*time.Hour, // lookbackPeriod
+		6*time.Hour,  // updatePeriod
+		time.Minute,  // updateTimeout
+		1, 1,
+		"stale-if-error=60",
+		5*time.Minute,
+		&fakeSAC{
+			revokedCerts: revokedCertsStream{},
+			maxNotAfter:  clk.Now().Add(90 * 24 * time.Hour),
+		},
+		&fakeCA{gcc: generateCRLStream{}},
+		&fakeStorer{uploaderStream: &noopUploader{}},
 		metrics.NoopRegisterer, blog.NewMock(), clk,
 	)
 	test.AssertNotError(t, err, "building test crlUpdater")
 
-	testChunks := []chunk{
-		{clk.Now(), clk.Now().Add(18 * time.Hour), 0},
+	// Ensure that getting no results from the SA still works.
+	err = cu.updateShard(ctx, cu.clk.Now(), e1.NameID(), 1)
+	test.AssertNotError(t, err, "empty CRL")
+	test.AssertMetricWithLabelsEquals(t, cu.updatedCounter, prometheus.Labels{
+		"issuer": "(TEST) Elegant Elephant E1", "result": "success",
+	}, 1)
+
+	// Make a CRL with actual contents. Verify that the information makes it through
+	// each of the steps:
+	//  - read from SA
+	//  - write to CA and read the response
+	//  - upload with CRL storer
+	//
+	// The final response should show up in the bytes recorded by our fake storer.
+	recordingUploader := &recordingUploader{}
+	now := timestamppb.Now()
+	cu.cs = &fakeStorer{uploaderStream: recordingUploader}
+	cu.sa = &fakeSAC{
+		revokedCerts: revokedCertsStream{
+			entries: []*corepb.CRLEntry{
+				{
+					Serial:    "0311b5d430823cfa25b0fc85d14c54ee35",
+					Reason:    int32(revocation.KeyCompromise),
+					RevokedAt: now,
+				},
+				{
+					Serial:    "037d6a05a0f6a975380456ae605cee9889",
+					Reason:    int32(revocation.AffiliationChanged),
+					RevokedAt: now,
+				},
+				{
+					Serial:    "03aa617ab8ee58896ba082bfa25199c884",
+					Reason:    int32(revocation.Unspecified),
+					RevokedAt: now,
+				},
+			},
+		},
+		maxNotAfter: clk.Now().Add(90 * 24 * time.Hour),
+	}
+	// We ask for shard 2 specifically because GetRevokedCertsByShard only returns our
+	// certificate for that shard.
+	err = cu.updateShard(ctx, cu.clk.Now(), e1.NameID(), 2)
+	test.AssertNotError(t, err, "updateShard")
+
+	expectedEntries := map[string]int32{
+		"0311b5d430823cfa25b0fc85d14c54ee35": int32(revocation.KeyCompromise),
+		"037d6a05a0f6a975380456ae605cee9889": int32(revocation.AffiliationChanged),
+		"03aa617ab8ee58896ba082bfa25199c884": int32(revocation.Unspecified),
+	}
+	for r := range bytes.SplitSeq(recordingUploader.crlBody, []byte("\n")) {
+		if len(r) == 0 {
+			continue
+		}
+		var entry crlEntry
+		err := json.Unmarshal(r, &entry)
+		if err != nil {
+			t.Fatalf("unmarshaling JSON: %s", err)
+		}
+		expectedReason, ok := expectedEntries[entry.Serial]
+		if !ok {
+			t.Errorf("CRL entry for %s was unexpected", entry.Serial)
+		}
+		if entry.Reason != expectedReason {
+			t.Errorf("CRL entry for %s had reason=%d, want %d", entry.Serial, entry.Reason, expectedReason)
+		}
+		delete(expectedEntries, entry.Serial)
+	}
+	// At this point the expectedEntries map should be empty; if it's not, emit an error
+	// for each remaining expectation.
+	for k, v := range expectedEntries {
+		t.Errorf("expected cert %s to be revoked for reason=%d, but it was not on the CRL", k, v)
 	}
 
+	cu.updatedCounter.Reset()
+
 	// Ensure that getting no results from the SA still works.
-	err = cu.updateShard(ctx, cu.clk.Now(), e1.NameID(), 0, testChunks)
+	err = cu.updateShard(ctx, cu.clk.Now(), e1.NameID(), 1)
 	test.AssertNotError(t, err, "empty CRL")
 	test.AssertMetricWithLabelsEquals(t, cu.updatedCounter, prometheus.Labels{
 		"issuer": "(TEST) Elegant Elephant E1", "result": "success",
@@ -177,8 +312,8 @@ func TestUpdateShard(t *testing.T) {
 	cu.updatedCounter.Reset()
 
 	// Errors closing the Storer upload stream should bubble up.
-	cu.cs = &fakeCSC{ucc: fakeUCC{recvErr: sentinelErr}}
-	err = cu.updateShard(ctx, cu.clk.Now(), e1.NameID(), 0, testChunks)
+	cu.cs = &fakeStorer{uploaderStream: &noopUploader{recvErr: sentinelErr}}
+	err = cu.updateShard(ctx, cu.clk.Now(), e1.NameID(), 1)
 	test.AssertError(t, err, "storer error")
 	test.AssertContains(t, err.Error(), "closing CRLStorer upload stream")
 	test.AssertErrorIs(t, err, sentinelErr)
@@ -188,8 +323,8 @@ func TestUpdateShard(t *testing.T) {
 	cu.updatedCounter.Reset()
 
 	// Errors sending to the Storer should bubble up sooner.
-	cu.cs = &fakeCSC{ucc: fakeUCC{sendErr: sentinelErr}}
-	err = cu.updateShard(ctx, cu.clk.Now(), e1.NameID(), 0, testChunks)
+	cu.cs = &fakeStorer{uploaderStream: &noopUploader{sendErr: sentinelErr}}
+	err = cu.updateShard(ctx, cu.clk.Now(), e1.NameID(), 1)
 	test.AssertError(t, err, "storer error")
 	test.AssertContains(t, err.Error(), "sending CRLStorer metadata")
 	test.AssertErrorIs(t, err, sentinelErr)
@@ -199,8 +334,8 @@ func TestUpdateShard(t *testing.T) {
 	cu.updatedCounter.Reset()
 
 	// Errors reading from the CA should bubble up sooner.
-	cu.ca = &fakeCGC{gcc: fakeGCC{recvErr: sentinelErr}}
-	err = cu.updateShard(ctx, cu.clk.Now(), e1.NameID(), 0, testChunks)
+	cu.ca = &fakeCA{gcc: generateCRLStream{recvErr: sentinelErr}}
+	err = cu.updateShard(ctx, cu.clk.Now(), e1.NameID(), 1)
 	test.AssertError(t, err, "CA error")
 	test.AssertContains(t, err.Error(), "receiving CRL bytes")
 	test.AssertErrorIs(t, err, sentinelErr)
@@ -210,8 +345,8 @@ func TestUpdateShard(t *testing.T) {
 	cu.updatedCounter.Reset()
 
 	// Errors sending to the CA should bubble up sooner.
-	cu.ca = &fakeCGC{gcc: fakeGCC{sendErr: sentinelErr}}
-	err = cu.updateShard(ctx, cu.clk.Now(), e1.NameID(), 0, testChunks)
+	cu.ca = &fakeCA{gcc: generateCRLStream{sendErr: sentinelErr}}
+	err = cu.updateShard(ctx, cu.clk.Now(), e1.NameID(), 1)
 	test.AssertError(t, err, "CA error")
 	test.AssertContains(t, err.Error(), "sending CA metadata")
 	test.AssertErrorIs(t, err, sentinelErr)
@@ -221,8 +356,8 @@ func TestUpdateShard(t *testing.T) {
 	cu.updatedCounter.Reset()
 
 	// Errors reading from the SA should bubble up soonest.
-	cu.sa = &fakeSAC{grcc: fakeGRCC{err: sentinelErr}, maxNotAfter: clk.Now().Add(90 * 24 * time.Hour)}
-	err = cu.updateShard(ctx, cu.clk.Now(), e1.NameID(), 0, testChunks)
+	cu.sa = &fakeSAC{revokedCerts: revokedCertsStream{err: sentinelErr}, maxNotAfter: clk.Now().Add(90 * 24 * time.Hour)}
+	err = cu.updateShard(ctx, cu.clk.Now(), e1.NameID(), 1)
 	test.AssertError(t, err, "database error")
 	test.AssertContains(t, err.Error(), "retrieving entry from SA")
 	test.AssertErrorIs(t, err, sentinelErr)
@@ -250,21 +385,19 @@ func TestUpdateShardWithRetry(t *testing.T) {
 		[]*issuance.Certificate{e1, r3},
 		2, 18*time.Hour, 24*time.Hour,
 		6*time.Hour, time.Minute, 1, 1,
-		&fakeSAC{grcc: fakeGRCC{err: sentinelErr}, maxNotAfter: clk.Now().Add(90 * 24 * time.Hour)},
-		&fakeCGC{gcc: fakeGCC{}},
-		&fakeCSC{ucc: fakeUCC{}},
+		"stale-if-error=60",
+		5*time.Minute,
+		&fakeSAC{revokedCerts: revokedCertsStream{err: sentinelErr}, maxNotAfter: clk.Now().Add(90 * 24 * time.Hour)},
+		&fakeCA{gcc: generateCRLStream{}},
+		&fakeStorer{uploaderStream: &noopUploader{}},
 		metrics.NoopRegisterer, blog.NewMock(), clk,
 	)
 	test.AssertNotError(t, err, "building test crlUpdater")
 
-	testChunks := []chunk{
-		{clk.Now(), clk.Now().Add(18 * time.Hour), 0},
-	}
-
 	// Ensure that having MaxAttempts set to 1 results in the clock not moving
 	// forward at all.
 	startTime := cu.clk.Now()
-	err = cu.updateShardWithRetry(ctx, cu.clk.Now(), e1.NameID(), 0, testChunks)
+	err = cu.updateShardWithRetry(ctx, cu.clk.Now(), e1.NameID(), 1)
 	test.AssertError(t, err, "database error")
 	test.AssertErrorIs(t, err, sentinelErr)
 	test.AssertEquals(t, cu.clk.Now(), startTime)
@@ -274,128 +407,11 @@ func TestUpdateShardWithRetry(t *testing.T) {
 	// in, so we have to be approximate.
 	cu.maxAttempts = 5
 	startTime = cu.clk.Now()
-	err = cu.updateShardWithRetry(ctx, cu.clk.Now(), e1.NameID(), 0, testChunks)
+	err = cu.updateShardWithRetry(ctx, cu.clk.Now(), e1.NameID(), 1)
 	test.AssertError(t, err, "database error")
 	test.AssertErrorIs(t, err, sentinelErr)
 	t.Logf("start: %v", startTime)
 	t.Logf("now: %v", cu.clk.Now())
 	test.Assert(t, startTime.Add(15*0.8*time.Second).Before(cu.clk.Now()), "retries didn't sleep enough")
 	test.Assert(t, startTime.Add(15*1.2*time.Second).After(cu.clk.Now()), "retries slept too much")
-}
-
-func TestGetShardMappings(t *testing.T) {
-	// We set atTime to be exactly one day (numShards * shardWidth) after the
-	// anchorTime for these tests, so that we know that the index of the first
-	// chunk we would normally (i.e. not taking lookback or overshoot into
-	// account) care about is 0.
-	atTime := anchorTime().Add(24 * time.Hour)
-
-	// When there is no lookback, and the maxNotAfter is exactly as far in the
-	// future as the numShards * shardWidth looks, every shard should be mapped to
-	// exactly one chunk.
-	tcu := crlUpdater{
-		numShards:      24,
-		shardWidth:     1 * time.Hour,
-		sa:             &fakeSAC{maxNotAfter: atTime.Add(23*time.Hour + 30*time.Minute)},
-		lookbackPeriod: 0,
-	}
-	m, err := tcu.getShardMappings(context.Background(), atTime)
-	test.AssertNotError(t, err, "getting aligned shards")
-	test.AssertEquals(t, len(m), 24)
-	for _, s := range m {
-		test.AssertEquals(t, len(s), 1)
-	}
-
-	// When there is 1.5 hours each of lookback and maxNotAfter overshoot, then
-	// there should be four shards which each get two chunks mapped to them.
-	tcu = crlUpdater{
-		numShards:      24,
-		shardWidth:     1 * time.Hour,
-		sa:             &fakeSAC{maxNotAfter: atTime.Add(24*time.Hour + 90*time.Minute)},
-		lookbackPeriod: 90 * time.Minute,
-	}
-	m, err = tcu.getShardMappings(context.Background(), atTime)
-	test.AssertNotError(t, err, "getting overshoot shards")
-	test.AssertEquals(t, len(m), 24)
-	for i, s := range m {
-		if i == 0 || i == 1 || i == 22 || i == 23 {
-			test.AssertEquals(t, len(s), 2)
-		} else {
-			test.AssertEquals(t, len(s), 1)
-		}
-	}
-
-	// When there is a massive amount of overshoot, many chunks should be mapped
-	// to each shard.
-	tcu = crlUpdater{
-		numShards:      24,
-		shardWidth:     1 * time.Hour,
-		sa:             &fakeSAC{maxNotAfter: atTime.Add(90 * 24 * time.Hour)},
-		lookbackPeriod: time.Minute,
-	}
-	m, err = tcu.getShardMappings(context.Background(), atTime)
-	test.AssertNotError(t, err, "getting overshoot shards")
-	test.AssertEquals(t, len(m), 24)
-	for i, s := range m {
-		if i == 23 {
-			test.AssertEquals(t, len(s), 91)
-		} else {
-			test.AssertEquals(t, len(s), 90)
-		}
-	}
-
-	// An arbitrarily-chosen chunk should always end up in the same shard no
-	// matter what the current time, lookback, and overshoot are, as long as the
-	// number of shards and the shard width remains constant.
-	tcu = crlUpdater{
-		numShards:      24,
-		shardWidth:     1 * time.Hour,
-		sa:             &fakeSAC{maxNotAfter: atTime.Add(24 * time.Hour)},
-		lookbackPeriod: time.Hour,
-	}
-	m, err = tcu.getShardMappings(context.Background(), atTime)
-	test.AssertNotError(t, err, "getting consistency shards")
-	test.AssertEquals(t, m[10][0].start, anchorTime().Add(34*time.Hour))
-	tcu.lookbackPeriod = 4 * time.Hour
-	m, err = tcu.getShardMappings(context.Background(), atTime)
-	test.AssertNotError(t, err, "getting consistency shards")
-	test.AssertEquals(t, m[10][0].start, anchorTime().Add(34*time.Hour))
-	tcu.sa = &fakeSAC{maxNotAfter: atTime.Add(300 * 24 * time.Hour)}
-	m, err = tcu.getShardMappings(context.Background(), atTime)
-	test.AssertNotError(t, err, "getting consistency shards")
-	test.AssertEquals(t, m[10][0].start, anchorTime().Add(34*time.Hour))
-	atTime = atTime.Add(6 * time.Hour)
-	m, err = tcu.getShardMappings(context.Background(), atTime)
-	test.AssertNotError(t, err, "getting consistency shards")
-	test.AssertEquals(t, m[10][0].start, anchorTime().Add(34*time.Hour))
-}
-
-func TestGetChunkAtTime(t *testing.T) {
-	// Our test updater divides time into chunks 1 day wide, numbered 0 through 9.
-	numShards := 10
-	shardWidth := 24 * time.Hour
-
-	// The chunk right at the anchor time should have index 0 and start at the
-	// anchor time. This also tests behavior when atTime is on a chunk boundary.
-	atTime := anchorTime()
-	c, err := GetChunkAtTime(shardWidth, numShards, atTime)
-	test.AssertNotError(t, err, "getting chunk at anchor")
-	test.AssertEquals(t, c.Idx, 0)
-	test.Assert(t, c.start.Equal(atTime), "getting chunk at anchor")
-	test.Assert(t, c.end.Equal(atTime.Add(24*time.Hour)), "getting chunk at anchor")
-
-	// The chunk a bit over a year in the future should have index 5.
-	atTime = anchorTime().Add(365 * 24 * time.Hour)
-	c, err = GetChunkAtTime(shardWidth, numShards, atTime.Add(time.Minute))
-	test.AssertNotError(t, err, "getting chunk")
-	test.AssertEquals(t, c.Idx, 5)
-	test.Assert(t, c.start.Equal(atTime), "getting chunk")
-	test.Assert(t, c.end.Equal(atTime.Add(24*time.Hour)), "getting chunk")
-
-	// A chunk very far in the future should break the math. We have to add to
-	// the time twice, since the whole point of "very far in the future" is that
-	// it isn't representable by a time.Duration.
-	atTime = anchorTime().Add(200 * 365 * 24 * time.Hour).Add(200 * 365 * 24 * time.Hour)
-	c, err = GetChunkAtTime(shardWidth, numShards, atTime)
-	test.AssertError(t, err, "getting far-future chunk")
 }

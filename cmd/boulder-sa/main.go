@@ -5,6 +5,8 @@ import (
 	"flag"
 	"os"
 
+	"github.com/jmhodges/clock"
+
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/config"
 	"github.com/letsencrypt/boulder/features"
@@ -58,7 +60,7 @@ func main() {
 
 	scope, logger, oTelShutdown := cmd.StatsAndLogging(c.Syslog, c.OpenTelemetry, c.SA.DebugAddr)
 	defer oTelShutdown(context.Background())
-	logger.Info(cmd.VersionString())
+	cmd.LogStartup(logger)
 
 	dbMap, err := sa.InitWrappedDb(c.SA.DB, scope, logger)
 	cmd.FailOnError(err, "While initializing dbMap")
@@ -75,12 +77,9 @@ func main() {
 		cmd.FailOnError(err, "While initializing dbIncidentsMap")
 	}
 
-	clk := cmd.Clock()
+	clk := clock.New()
 
-	parallel := c.SA.ParallelismPerRPC
-	if parallel < 1 {
-		parallel = 1
-	}
+	parallel := max(c.SA.ParallelismPerRPC, 1)
 
 	tls, err := c.SA.TLS.Load(scope)
 	cmd.FailOnError(err, "TLS config")

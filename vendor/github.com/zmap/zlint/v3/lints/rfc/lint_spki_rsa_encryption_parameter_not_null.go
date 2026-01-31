@@ -1,7 +1,7 @@
 package rfc
 
 /*
- * ZLint Copyright 2023 Regents of the University of Michigan
+ * ZLint Copyright 2024 Regents of the University of Michigan
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not
  * use this file except in compliance with the License. You may obtain a copy
@@ -61,7 +61,7 @@ func (l *rsaSPKIEncryptionParamNotNULL) Execute(c *x509.Certificate) *lint.LintR
 	}
 
 	if err := util.CheckAlgorithmIDParamNotNULL(encodedPublicKeyAid, util.OidRSAEncryption); err != nil {
-		return &lint.LintResult{Status: lint.Error, Details: fmt.Sprintf("certificate pkixPublicKey %s", err.Error())}
+		return &lint.LintResult{Status: lint.Error, Details: "certificate pkixPublicKey " + err.Error()}
 	}
 
 	return &lint.LintResult{Status: lint.Pass}

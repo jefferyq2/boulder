@@ -6,17 +6,16 @@
 		"dnsProvider": {
 			"dnsAuthority": "consul.service.consul",
 			"srvLookup": {
-				"service": "dns",
+				"service": "doh",
 				"domain": "service.consul"
 			}
 		},
 		"dnsTimeout": "1s",
-		"dnsAllowLoopbackAddresses": true,
 		"issuerDomain": "happy-hacker-ca.invalid",
 		"tls": {
-			"caCertfile": "test/grpc-creds/minica.pem",
-			"certFile": "test/grpc-creds/va.boulder/cert.pem",
-			"keyFile": "test/grpc-creds/va.boulder/key.pem"
+			"caCertfile": "test/certs/ipki/minica.pem",
+			"certFile": "test/certs/ipki/va.boulder/cert.pem",
+			"keyFile": "test/certs/ipki/va.boulder/key.pem"
 		},
 		"grpc": {
 			"maxConnectionAge": "30s",
@@ -39,32 +38,31 @@
 			}
 		},
 		"features": {
-			"EnforceMultiVA": true,
-			"MultiVAFullResults": true
+			"DOH": true
 		},
 		"remoteVAs": [
 			{
 				"serverAddress": "rva1.service.consul:9397",
 				"timeout": "15s",
-				"hostOverride": "rva1.boulder"
+				"hostOverride": "rva1.boulder",
+				"perspective": "dadaist",
+				"rir": "ARIN"
 			},
 			{
 				"serverAddress": "rva1.service.consul:9498",
 				"timeout": "15s",
-				"hostOverride": "rva1.boulder"
+				"hostOverride": "rva1.boulder",
+				"perspective": "surrealist",
+				"rir": "RIPE"
 			},
 			{
-				"serverAddress": "rva2.service.consul:9897",
+				"serverAddress": "rva1.service.consul:9499",
 				"timeout": "15s",
-				"hostOverride": "rva2.boulder"
-			},
-			{
-				"serverAddress": "rva2.service.consul:9998",
-				"timeout": "15s",
-				"hostOverride": "rva2.boulder"
+				"hostOverride": "rva1.boulder",
+				"perspective": "cubist",
+				"rir": "ARIN"
 			}
 		],
-		"maxRemoteValidationFailures": 1,
 		"accountURIPrefixes": [
 			"http://boulder.service.consul:4000/acme/reg/",
 			"http://boulder.service.consul:4001/acme/acct/"

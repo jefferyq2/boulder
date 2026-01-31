@@ -17,9 +17,6 @@ import (
 
 type policyInfoConfig struct {
 	OID string
-	// Deprecated: we do not include the id-qt-cps policy qualifier in our
-	// certificate policy extensions anymore.
-	CPSURI string `yaml:"cps-uri"`
 }
 
 // certProfile contains the information required to generate a certificate
@@ -44,9 +41,6 @@ type certProfile struct {
 	// always be UTC.
 	NotAfter string `yaml:"not-after"`
 
-	// OCSPURL should contain the URL at which a OCSP responder that
-	// can respond to OCSP requests for this certificate operates
-	OCSPURL string `yaml:"ocsp-url"`
 	// CRLURL should contain the URL at which CRLs for this certificate
 	// can be found
 	CRLURL string `yaml:"crl-url"`
@@ -79,8 +73,6 @@ type certType int
 const (
 	rootCert certType = iota
 	intermediateCert
-	ocspCert
-	crlCert
 	crossCert
 	requestCert
 )
@@ -104,9 +96,6 @@ func (profile *certProfile) verifyProfile(ct certType) error {
 		}
 		if profile.SignatureAlgorithm != "" {
 			return errors.New("signature-algorithm cannot be set for a CSR")
-		}
-		if profile.OCSPURL != "" {
-			return errors.New("ocsp-url cannot be set for a CSR")
 		}
 		if profile.CRLURL != "" {
 			return errors.New("crl-url cannot be set for a CSR")
@@ -156,29 +145,18 @@ func (profile *certProfile) verifyProfile(ct certType) error {
 		}
 
 		// BR 7.1.2.10.5 CA Certificate Certificate Policies
-		// OID 2.23.140.1.2.1 is an anyPolicy
+		// OID 2.23.140.1.2.1 is CABF BRs Domain Validated
 		if len(profile.Policies) != 1 || profile.Policies[0].OID != "2.23.140.1.2.1" {
 			return errors.New("policy should be exactly BRs domain-validated for subordinate CAs")
 		}
 	}
 
-	if ct == ocspCert || ct == crlCert {
-		if len(profile.KeyUsages) != 0 {
-			return errors.New("key-usages cannot be set for a delegated signer")
-		}
-		if profile.CRLURL != "" {
-			return errors.New("crl-url cannot be set for a delegated signer")
-		}
-		if profile.OCSPURL != "" {
-			return errors.New("ocsp-url cannot be set for a delegated signer")
-		}
-	}
 	return nil
 }
 
 func parseOID(oidStr string) (asn1.ObjectIdentifier, error) {
 	var oid asn1.ObjectIdentifier
-	for _, a := range strings.Split(oidStr, ".") {
+	for a := range strings.SplitSeq(oidStr, ".") {
 		i, err := strconv.Atoi(a)
 		if err != nil {
 			return nil, err
@@ -196,8 +174,6 @@ var stringToKeyUsage = map[string]x509.KeyUsage{
 	"CRL Sign":          x509.KeyUsageCRLSign,
 	"Cert Sign":         x509.KeyUsageCertSign,
 }
-
-var oidOCSPNoCheck = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 1, 5}
 
 func generateSKID(pk []byte) ([]byte, error) {
 	var pkixPublicKey struct {
@@ -223,10 +199,6 @@ func makeTemplate(randReader io.Reader, profile *certProfile, pubKey []byte, tbc
 		return nil, fmt.Errorf("toBeCrossSigned cert field was nil, but was required to gather EKUs for the lint cert")
 	}
 
-	var ocspServer []string
-	if profile.OCSPURL != "" {
-		ocspServer = []string{profile.OCSPURL}
-	}
 	var crlDistributionPoints []string
 	if profile.CRLURL != "" {
 		crlDistributionPoints = []string{profile.CRLURL}
@@ -255,11 +227,6 @@ func makeTemplate(randReader io.Reader, profile *certProfile, pubKey []byte, tbc
 		}
 		ku |= kuBit
 	}
-	if ct == ocspCert {
-		ku = x509.KeyUsageDigitalSignature
-	} else if ct == crlCert {
-		ku = x509.KeyUsageCRLSign
-	}
 	if ku == 0 {
 		return nil, errors.New("at least one key usage must be set")
 	}
@@ -269,7 +236,6 @@ func makeTemplate(randReader io.Reader, profile *certProfile, pubKey []byte, tbc
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 		Subject:               profile.Subject(),
-		OCSPServer:            ocspServer,
 		CRLDistributionPoints: crlDistributionPoints,
 		IssuingCertificateURL: issuingCertificateURL,
 		KeyUsage:              ku,
@@ -286,11 +252,23 @@ func makeTemplate(randReader io.Reader, profile *certProfile, pubKey []byte, tbc
 		if err != nil {
 			return nil, err
 		}
-		cert.NotBefore = notBefore
 		notAfter, err := time.Parse(time.DateTime, profile.NotAfter)
 		if err != nil {
 			return nil, err
 		}
+		validity := notAfter.Add(time.Second).Sub(notBefore)
+		if ct == rootCert && validity >= 9132*24*time.Hour {
+			// The value 9132 comes directly from the BRs, where it is described
+			// as "approximately 25 years". It's equal to 365 * 25 + 7, to allow
+			// for some leap years.
+			return nil, fmt.Errorf("root cert validity too large: %s >= 25 years", validity)
+		} else if (ct == intermediateCert || ct == crossCert) && validity >= 8*365*24*time.Hour {
+			// Our CP/CPS states "at most 8 years", so we calculate that number
+			// in the most conservative way (i.e. not accounting for leap years)
+			// to give ourselves a buffer.
+			return nil, fmt.Errorf("subordinate CA cert validity too large: %s >= 8 years", validity)
+		}
+		cert.NotBefore = notBefore
 		cert.NotAfter = notAfter
 	}
 
@@ -299,33 +277,26 @@ func makeTemplate(randReader io.Reader, profile *certProfile, pubKey []byte, tbc
 	// 		BR 7.1.2.1.2 Root CA Extensions
 	// 		Extension 	Presence 	Critical 	Description
 	// 		extKeyUsage 	MUST NOT 	N 	-
-	case ocspCert:
-		cert.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageOCSPSigning}
-		// ASN.1 NULL is 0x05, 0x00
-		ocspNoCheckExt := pkix.Extension{Id: oidOCSPNoCheck, Value: []byte{5, 0}}
-		cert.ExtraExtensions = append(cert.ExtraExtensions, ocspNoCheckExt)
-		cert.IsCA = false
-	case crlCert:
-		cert.IsCA = false
 	case requestCert, intermediateCert:
-		// id-kp-serverAuth and id-kp-clientAuth are included in intermediate
-		// certificates in order to technically constrain them. id-kp-serverAuth
-		// is required by 7.1.2.2.g of the CABF Baseline Requirements, but
-		// id-kp-clientAuth isn't. We include id-kp-clientAuth as we also include
-		// it in our end-entity certificates.
-		cert.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth}
+		// id-kp-serverAuth is included in intermediate certificates, as required by
+		// Section 7.1.2.10.6 of the CA/BF Baseline Requirements.
+		// id-kp-clientAuth is excluded, as required by section 3.2.1 of the Chrome
+		// Root Program Requirements.
+		cert.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
 		cert.MaxPathLenZero = true
 	case crossCert:
 		cert.ExtKeyUsage = tbcs.ExtKeyUsage
 		cert.MaxPathLenZero = tbcs.MaxPathLenZero
+		// The SKID needs to match the previous SKID, no matter how it was computed.
+		cert.SubjectKeyId = tbcs.SubjectKeyId
 	}
 
 	for _, policyConfig := range profile.Policies {
-		oid, err := parseOID(policyConfig.OID)
+		x509OID, err := x509.ParseOID(policyConfig.OID)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to parse %s as OID: %w", policyConfig.OID, err)
 		}
-		cert.PolicyIdentifiers = append(cert.PolicyIdentifiers, oid)
+		cert.Policies = append(cert.Policies, x509OID)
 	}
 
 	return cert, nil

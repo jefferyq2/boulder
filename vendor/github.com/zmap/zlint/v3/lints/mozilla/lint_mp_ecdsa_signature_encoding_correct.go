@@ -1,7 +1,7 @@
 package mozilla
 
 /*
- * ZLint Copyright 2023 Regents of the University of Michigan
+ * ZLint Copyright 2024 Regents of the University of Michigan
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not
  * use this file except in compliance with the License. You may obtain a copy
@@ -103,7 +103,7 @@ func (l *ecdsaSignatureAidEncoding) Execute(c *x509.Certificate) *lint.LintResul
 		}
 		return &lint.LintResult{
 			Status:  lint.Error,
-			Details: fmt.Sprintf("Encoding of signature algorithm does not match signing key on P-256 curve. Got the unsupported %s", hex.EncodeToString(encoded)),
+			Details: "Encoding of signature algorithm does not match signing key on P-256 curve. Got the unsupported " + hex.EncodeToString(encoded),
 		}
 	} else if signatureSize <= maxP384SigByteLen {
 		expectedEncoding := []byte{0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03}
@@ -113,7 +113,7 @@ func (l *ecdsaSignatureAidEncoding) Execute(c *x509.Certificate) *lint.LintResul
 		}
 		return &lint.LintResult{
 			Status:  lint.Error,
-			Details: fmt.Sprintf("Encoding of signature algorithm does not match signing key on P-384 curve. Got the unsupported %s", hex.EncodeToString(encoded)),
+			Details: "Encoding of signature algorithm does not match signing key on P-384 curve. Got the unsupported " + hex.EncodeToString(encoded),
 		}
 	}
 	return &lint.LintResult{

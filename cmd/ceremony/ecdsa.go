@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/letsencrypt/boulder/pkcs11helpers"
 	"github.com/miekg/pkcs11"
+
+	"github.com/letsencrypt/boulder/pkcs11helpers"
 )
 
 var stringToCurve = map[string]elliptic.Curve{
-	elliptic.P224().Params().Name: elliptic.P224(),
 	elliptic.P256().Params().Name: elliptic.P256(),
 	elliptic.P384().Params().Name: elliptic.P384(),
 	elliptic.P521().Params().Name: elliptic.P521(),
@@ -20,7 +20,6 @@ var stringToCurve = map[string]elliptic.Curve{
 
 // curveToOIDDER maps the name of the curves to their DER encoded OIDs
 var curveToOIDDER = map[string][]byte{
-	elliptic.P224().Params().Name: {6, 5, 43, 129, 4, 0, 33},
 	elliptic.P256().Params().Name: {6, 8, 42, 134, 72, 206, 61, 3, 1, 7},
 	elliptic.P384().Params().Name: {6, 5, 43, 129, 4, 0, 34},
 	elliptic.P521().Params().Name: {6, 5, 43, 129, 4, 0, 35},
@@ -70,7 +69,7 @@ func ecPub(
 		return nil, err
 	}
 	if pubKey.Curve != expectedCurve {
-		return nil, errors.New("Returned EC parameters doesn't match expected curve")
+		return nil, errors.New("returned EC parameters doesn't match expected curve")
 	}
 	log.Printf("\tX: %X\n", pubKey.X.Bytes())
 	log.Printf("\tY: %X\n", pubKey.Y.Bytes())

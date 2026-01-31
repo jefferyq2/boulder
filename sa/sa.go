@@ -3,15 +3,19 @@ package sa
 import (
 	"context"
 	"crypto/x509"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
+	"github.com/go-jose/go-jose/v4"
 	"github.com/jmhodges/clock"
 	"github.com/prometheus/client_golang/prometheus"
-	"golang.org/x/crypto/ocsp"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -19,11 +23,12 @@ import (
 	corepb "github.com/letsencrypt/boulder/core/proto"
 	"github.com/letsencrypt/boulder/db"
 	berrors "github.com/letsencrypt/boulder/errors"
-	"github.com/letsencrypt/boulder/features"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
+	"github.com/letsencrypt/boulder/identifier"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/revocation"
 	sapb "github.com/letsencrypt/boulder/sa/proto"
+	"github.com/letsencrypt/boulder/unpause"
 )
 
 var (
@@ -36,7 +41,8 @@ var (
 // read-only methods provided by the SQLStorageAuthorityRO, those wrapper
 // implementations are in saro.go, next to the real implementations.
 type SQLStorageAuthority struct {
-	sapb.UnimplementedStorageAuthorityServer
+	sapb.UnsafeStorageAuthorityServer
+
 	*SQLStorageAuthorityRO
 
 	dbMap *db.WrappedMap
@@ -49,6 +55,8 @@ type SQLStorageAuthority struct {
 	rateLimitWriteErrors prometheus.Counter
 }
 
+var _ sapb.StorageAuthorityServer = (*SQLStorageAuthority)(nil)
+
 // NewSQLStorageAuthorityWrapping provides persistence using a SQL backend for
 // Boulder. It takes a read-only storage authority to wrap, which is useful if
 // you are constructing both types of implementations and want to share
@@ -58,11 +66,10 @@ func NewSQLStorageAuthorityWrapping(
 	dbMap *db.WrappedMap,
 	stats prometheus.Registerer,
 ) (*SQLStorageAuthority, error) {
-	rateLimitWriteErrors := prometheus.NewCounter(prometheus.CounterOpts{
+	rateLimitWriteErrors := promauto.With(stats).NewCounter(prometheus.CounterOpts{
 		Name: "rate_limit_write_errors",
 		Help: "number of failed ratelimit update transactions during AddCertificate",
 	})
-	stats.MustRegister(rateLimitWriteErrors)
 
 	ssa := &SQLStorageAuthority{
 		SQLStorageAuthorityRO: ssaro,
@@ -96,7 +103,7 @@ func NewSQLStorageAuthority(
 
 // NewRegistration stores a new Registration
 func (ssa *SQLStorageAuthority) NewRegistration(ctx context.Context, req *corepb.Registration) (*corepb.Registration, error) {
-	if len(req.Key) == 0 || len(req.InitialIP) == 0 {
+	if len(req.Key) == 0 {
 		return nil, errIncompleteRequest
 	}
 
@@ -119,48 +126,69 @@ func (ssa *SQLStorageAuthority) NewRegistration(ctx context.Context, req *corepb
 	return registrationModelToPb(reg)
 }
 
-// UpdateRegistration stores an updated Registration
-func (ssa *SQLStorageAuthority) UpdateRegistration(ctx context.Context, req *corepb.Registration) (*emptypb.Empty, error) {
-	if req == nil || req.Id == 0 || len(req.Key) == 0 || len(req.InitialIP) == 0 {
+// UpdateRegistrationKey stores an updated key in a Registration.
+func (ssa *SQLStorageAuthority) UpdateRegistrationKey(ctx context.Context, req *sapb.UpdateRegistrationKeyRequest) (*corepb.Registration, error) {
+	if core.IsAnyNilOrZero(req.RegistrationID, req.Jwk) {
 		return nil, errIncompleteRequest
 	}
 
-	curr, err := selectRegistration(ctx, ssa.dbMap, "id", req.Id)
+	// Even though we don't need to convert from JSON to an in-memory JSONWebKey
+	// for the sake of the `Key` field, we do need to do the conversion in order
+	// to compute the SHA256 key digest.
+	var jwk jose.JSONWebKey
+	err := jwk.UnmarshalJSON(req.Jwk)
 	if err != nil {
-		if db.IsNoRows(err) {
-			return nil, berrors.NotFoundError("registration with ID '%d' not found", req.Id)
+		return nil, fmt.Errorf("parsing JWK: %w", err)
+	}
+	sha, err := core.KeyDigestB64(jwk.Key)
+	if err != nil {
+		return nil, fmt.Errorf("computing key digest: %w", err)
+	}
+
+	result, overallError := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (any, error) {
+		result, err := tx.ExecContext(ctx,
+			"UPDATE registrations SET jwk = ?, jwk_sha256 = ? WHERE id = ? LIMIT 1",
+			req.Jwk,
+			sha,
+			req.RegistrationID,
+		)
+		if err != nil {
+			if db.IsDuplicate(err) {
+				// duplicate entry error can only happen when jwk_sha256 collides, indicate
+				// to caller that the provided key is already in use
+				return nil, berrors.DuplicateError("key is already in use for a different account")
+			}
+			return nil, err
 		}
-		return nil, err
-	}
-
-	update, err := registrationPbToModel(req)
-	if err != nil {
-		return nil, err
-	}
-
-	// Copy the existing registration model's LockCol to the new updated
-	// registration model's LockCol
-	update.LockCol = curr.LockCol
-	n, err := ssa.dbMap.Update(ctx, update)
-	if err != nil {
-		if db.IsDuplicate(err) {
-			// duplicate entry error can only happen when jwk_sha256 collides, indicate
-			// to caller that the provided key is already in use
-			return nil, berrors.DuplicateError("key is already in use for a different account")
+		rowsAffected, err := result.RowsAffected()
+		if err != nil || rowsAffected != 1 {
+			return nil, berrors.InternalServerError("no registration ID '%d' updated with new jwk", req.RegistrationID)
 		}
-		return nil, err
-	}
-	if n == 0 {
-		return nil, berrors.NotFoundError("registration with ID '%d' not found", req.Id)
+
+		updatedRegistrationModel, err := selectRegistration(ctx, tx, "id", req.RegistrationID)
+		if err != nil {
+			if db.IsNoRows(err) {
+				return nil, berrors.NotFoundError("registration with ID '%d' not found", req.RegistrationID)
+			}
+			return nil, err
+		}
+		updatedRegistration, err := registrationModelToPb(updatedRegistrationModel)
+		if err != nil {
+			return nil, err
+		}
+
+		return updatedRegistration, nil
+	})
+	if overallError != nil {
+		return nil, overallError
 	}
 
-	return &emptypb.Empty{}, nil
+	return result.(*corepb.Registration), nil
 }
 
 // AddSerial writes a record of a serial number generation to the DB.
 func (ssa *SQLStorageAuthority) AddSerial(ctx context.Context, req *sapb.AddSerialRequest) (*emptypb.Empty, error) {
-	// TODO(#7153): Check each value via core.IsAnyNilOrZero
-	if req.Serial == "" || req.RegID == 0 || core.IsAnyNilOrZero(req.Created, req.Expires) {
+	if core.IsAnyNilOrZero(req.Serial, req.RegID, req.Created, req.Expires) {
 		return nil, errIncompleteRequest
 	}
 	err := ssa.dbMap.Insert(ctx, &recordedSerialModel{
@@ -175,39 +203,16 @@ func (ssa *SQLStorageAuthority) AddSerial(ctx context.Context, req *sapb.AddSeri
 	return &emptypb.Empty{}, nil
 }
 
-// SetCertificateStatusReady changes a serial's OCSP status from core.OCSPStatusNotReady to core.OCSPStatusGood.
-// Called when precertificate issuance succeeds. returns an error if the serial doesn't have status core.OCSPStatusNotReady.
-func (ssa *SQLStorageAuthority) SetCertificateStatusReady(ctx context.Context, req *sapb.Serial) (*emptypb.Empty, error) {
-	res, err := ssa.dbMap.ExecContext(ctx,
-		`UPDATE certificateStatus
-		 SET status = ?
-		 WHERE status = ? AND
-		       serial = ?`,
-		string(core.OCSPStatusGood),
-		string(core.OCSPStatusNotReady),
-		req.Serial,
-	)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return nil, err
-	}
-	if rows == 0 {
-		return nil, errors.New("failed to set certificate status to ready")
-	}
-
-	return &emptypb.Empty{}, nil
-}
-
-// AddPrecertificate writes a record of a precertificate generation to the DB.
+// AddPrecertificate writes a record of a linting certificate to the database.
+//
+// Note: The name "AddPrecertificate" is a historical artifact, and this is now
+// always called with a linting certificate. See #6807.
+//
 // Note: this is not idempotent: it does not protect against inserting the same
 // certificate multiple times. Calling code needs to first insert the cert's
 // serial into the Serials table to ensure uniqueness.
 func (ssa *SQLStorageAuthority) AddPrecertificate(ctx context.Context, req *sapb.AddCertificateRequest) (*emptypb.Empty, error) {
-	// TODO(#7153): Check each value via core.IsAnyNilOrZero
-	if len(req.Der) == 0 || req.RegID == 0 || req.IssuerNameID == 0 || core.IsAnyNilOrZero(req.Issued) {
+	if core.IsAnyNilOrZero(req.Der, req.RegID, req.IssuerNameID, req.Issued) {
 		return nil, errIncompleteRequest
 	}
 	parsed, err := x509.ParseCertificate(req.Der)
@@ -216,7 +221,7 @@ func (ssa *SQLStorageAuthority) AddPrecertificate(ctx context.Context, req *sapb
 	}
 	serialHex := core.SerialToString(parsed.SerialNumber)
 
-	preCertModel := &precertificateModel{
+	preCertModel := &lintingCertModel{
 		Serial:         serialHex,
 		RegistrationID: req.RegID,
 		DER:            req.Der,
@@ -224,7 +229,7 @@ func (ssa *SQLStorageAuthority) AddPrecertificate(ctx context.Context, req *sapb
 		Expires:        parsed.NotAfter,
 	}
 
-	_, overallError := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (interface{}, error) {
+	_, overallError := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (any, error) {
 		// Select to see if precert exists
 		var row struct {
 			Count int64
@@ -242,36 +247,35 @@ func (ssa *SQLStorageAuthority) AddPrecertificate(ctx context.Context, req *sapb
 			return nil, err
 		}
 
+		// An arbitrary, but valid date for fields revokedDate and lastExpirationNagSent.
+		// These fields in the database are NOT NULL so we can't omit them; and we don't
+		// want to pass `time.Time{}` because that results in inserts of `0000-00-00`, which
+		// is forbidden in strict mode (when NO_ZERO_DATE is on).
+		dummyDate := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+
 		status := core.OCSPStatusGood
-		if req.OcspNotReady {
-			status = core.OCSPStatusNotReady
-		}
-		cs := &core.CertificateStatus{
+		cs := &certificateStatusModel{
 			Serial:                serialHex,
 			Status:                status,
 			OCSPLastUpdated:       ssa.clk.Now(),
-			RevokedDate:           time.Time{},
+			RevokedDate:           dummyDate,
 			RevokedReason:         0,
-			LastExpirationNagSent: time.Time{},
+			LastExpirationNagSent: dummyDate,
 			NotAfter:              parsed.NotAfter,
 			IsExpired:             false,
-			IssuerNameID:          req.IssuerNameID,
+			IssuerID:              req.IssuerNameID,
 		}
 		err = ssa.dbMap.Insert(ctx, cs)
 		if err != nil {
 			return nil, err
 		}
 
-		// NOTE(@cpu): When we collect up names to check if an FQDN set exists (e.g.
-		// that it is a renewal) we use just the DNSNames from the certificate and
-		// ignore the Subject Common Name (if any). This is a safe assumption because
-		// if a certificate we issued were to have a Subj. CN not present as a SAN it
-		// would be a misissuance and miscalculating whether the cert is a renewal or
-		// not for the purpose of rate limiting is the least of our troubles.
+		idents := identifier.FromCert(parsed)
+
 		isRenewal, err := ssa.checkFQDNSetExists(
 			ctx,
 			tx.SelectOne,
-			parsed.DNSNames)
+			idents)
 		if err != nil {
 			return nil, err
 		}
@@ -298,8 +302,7 @@ func (ssa *SQLStorageAuthority) AddPrecertificate(ctx context.Context, req *sapb
 // AddCertificate stores an issued certificate, returning an error if it is a
 // duplicate or if any other failure occurs.
 func (ssa *SQLStorageAuthority) AddCertificate(ctx context.Context, req *sapb.AddCertificateRequest) (*emptypb.Empty, error) {
-	// TODO(#7153): Check each value via core.IsAnyNilOrZero
-	if len(req.Der) == 0 || req.RegID == 0 || core.IsAnyNilOrZero(req.Issued) {
+	if core.IsAnyNilOrZero(req.Der, req.RegID, req.Issued) {
 		return nil, errIncompleteRequest
 	}
 	parsedCertificate, err := x509.ParseCertificate(req.Der)
@@ -318,7 +321,7 @@ func (ssa *SQLStorageAuthority) AddCertificate(ctx context.Context, req *sapb.Ad
 		Expires:        parsedCertificate.NotAfter,
 	}
 
-	isRenewalRaw, overallError := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (interface{}, error) {
+	_, overallError := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (any, error) {
 		// Select to see if cert exists
 		var row struct {
 			Count int64
@@ -337,58 +340,23 @@ func (ssa *SQLStorageAuthority) AddCertificate(ctx context.Context, req *sapb.Ad
 			return nil, err
 		}
 
-		// NOTE(@cpu): When we collect up names to check if an FQDN set exists (e.g.
-		// that it is a renewal) we use just the DNSNames from the certificate and
-		// ignore the Subject Common Name (if any). This is a safe assumption because
-		// if a certificate we issued were to have a Subj. CN not present as a SAN it
-		// would be a misissuance and miscalculating whether the cert is a renewal or
-		// not for the purpose of rate limiting is the least of our troubles.
-		isRenewal, err := ssa.checkFQDNSetExists(
-			ctx,
-			tx.SelectOne,
-			parsedCertificate.DNSNames)
-		if err != nil {
-			return nil, err
-		}
-
-		return isRenewal, err
+		return nil, err
 	})
 	if overallError != nil {
 		return nil, overallError
 	}
 
-	// Recast the interface{} return from db.WithTransaction as a bool, returning
-	// an error if we can't.
-	var isRenewal bool
-	if boolVal, ok := isRenewalRaw.(bool); !ok {
-		return nil, fmt.Errorf(
-			"AddCertificate db.WithTransaction returned %T out var, expected bool",
-			isRenewalRaw)
-	} else {
-		isRenewal = boolVal
-	}
-
-	// In a separate transaction perform the work required to update tables used
-	// for rate limits. Since the effects of failing these writes is slight
-	// miscalculation of rate limits we choose to not fail the AddCertificate
-	// operation if the rate limit update transaction fails.
-	_, rlTransactionErr := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (interface{}, error) {
-		// Add to the rate limit table, but only for new certificates. Renewals
-		// don't count against the certificatesPerName limit.
-		if !isRenewal {
-			timeToTheHour := parsedCertificate.NotBefore.Round(time.Hour)
-			err := ssa.addCertificatesPerName(ctx, tx, parsedCertificate.DNSNames, timeToTheHour)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		// Update the FQDN sets now that there is a final certificate to ensure rate
-		// limits are calculated correctly.
+	// In a separate transaction, perform the work required to update the table
+	// used for order reuse. Since the effect of failing the write is just a
+	// missed opportunity to reuse an order, we choose to not fail the
+	// AddCertificate operation if this update transaction fails.
+	_, fqdnTransactionErr := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (any, error) {
+		// Update the FQDN sets now that there is a final certificate to ensure
+		// reuse is determined correctly.
 		err = addFQDNSet(
 			ctx,
 			tx,
-			parsedCertificate.DNSNames,
+			identifier.FromCert(parsedCertificate),
 			core.SerialToString(parsedCertificate.SerialNumber),
 			parsedCertificate.NotBefore,
 			parsedCertificate.NotAfter,
@@ -399,31 +367,67 @@ func (ssa *SQLStorageAuthority) AddCertificate(ctx context.Context, req *sapb.Ad
 
 		return nil, nil
 	})
-	// If the ratelimit transaction failed increment a stat and log a warning
+	// If the FQDN sets transaction failed, increment a stat and log a warning
 	// but don't return an error from AddCertificate.
-	if rlTransactionErr != nil {
+	if fqdnTransactionErr != nil {
 		ssa.rateLimitWriteErrors.Inc()
-		ssa.log.AuditErrf("failed AddCertificate ratelimit update transaction: %v", rlTransactionErr)
+		ssa.log.Errf("failed AddCertificate FQDN sets insert transaction: %v", fqdnTransactionErr)
 	}
 
 	return &emptypb.Empty{}, nil
 }
 
 // DeactivateRegistration deactivates a currently valid registration
-func (ssa *SQLStorageAuthority) DeactivateRegistration(ctx context.Context, req *sapb.RegistrationID) (*emptypb.Empty, error) {
+func (ssa *SQLStorageAuthority) DeactivateRegistration(ctx context.Context, req *sapb.RegistrationID) (*corepb.Registration, error) {
 	if req == nil || req.Id == 0 {
 		return nil, errIncompleteRequest
 	}
-	_, err := ssa.dbMap.ExecContext(ctx,
-		"UPDATE registrations SET status = ? WHERE status = ? AND id = ?",
-		string(core.StatusDeactivated),
-		string(core.StatusValid),
-		req.Id,
-	)
-	if err != nil {
-		return nil, err
+
+	result, overallError := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (any, error) {
+		result, err := tx.ExecContext(ctx,
+			"UPDATE registrations SET status = ? WHERE status = ? AND id = ? LIMIT 1",
+			string(core.StatusDeactivated),
+			string(core.StatusValid),
+			req.Id,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("deactivating account %d: %w", req.Id, err)
+		}
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("deactivating account %d: %w", req.Id, err)
+		}
+		if rowsAffected == 0 {
+			return nil, berrors.NotFoundError("no active account with id %d", req.Id)
+		} else if rowsAffected > 1 {
+			return nil, berrors.InternalServerError("unexpectedly deactivated multiple accounts with id %d", req.Id)
+		}
+
+		updatedRegistrationModel, err := selectRegistration(ctx, tx, "id", req.Id)
+		if err != nil {
+			if db.IsNoRows(err) {
+				return nil, berrors.NotFoundError("fetching account %d: no rows found", req.Id)
+			}
+			return nil, fmt.Errorf("fetching account %d: %w", req.Id, err)
+		}
+
+		updatedRegistration, err := registrationModelToPb(updatedRegistrationModel)
+		if err != nil {
+			return nil, err
+		}
+
+		return updatedRegistration, nil
+	})
+	if overallError != nil {
+		return nil, overallError
 	}
-	return &emptypb.Empty{}, nil
+
+	res, ok := result.(*corepb.Registration)
+	if !ok {
+		return nil, fmt.Errorf("unexpected casting failure in DeactivateRegistration")
+	}
+
+	return res, nil
 }
 
 // DeactivateAuthorization2 deactivates a currently valid or pending authorization.
@@ -434,7 +438,7 @@ func (ssa *SQLStorageAuthority) DeactivateAuthorization2(ctx context.Context, re
 
 	_, err := ssa.dbMap.ExecContext(ctx,
 		`UPDATE authz2 SET status = :deactivated WHERE id = :id and status IN (:valid,:pending)`,
-		map[string]interface{}{
+		map[string]any{
 			"deactivated": statusUint(core.StatusDeactivated),
 			"id":          req.Id,
 			"valid":       statusUint(core.StatusValid),
@@ -456,118 +460,64 @@ func (ssa *SQLStorageAuthority) NewOrderAndAuthzs(ctx context.Context, req *sapb
 	if req.NewOrder == nil {
 		return nil, errIncompleteRequest
 	}
+	if len(req.NewAuthzs) == 0 && len(req.NewOrder.V2Authorizations) == 0 {
+		return nil, errIncompleteRequest
+	}
 
-	output, err := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (interface{}, error) {
-		// First, insert all of the new authorizations and record their IDs.
-		newAuthzIDs := make([]int64, 0)
-		if len(req.NewAuthzs) != 0 {
-			inserter, err := db.NewMultiInserter("authz2", strings.Split(authzFields, ", "), "id")
-			if err != nil {
-				return nil, err
-			}
-			for _, authz := range req.NewAuthzs {
-				if authz.Status != string(core.StatusPending) {
-					return nil, berrors.InternalServerError("authorization must be pending")
-				}
-				am, err := authzPBToModel(authz)
-				if err != nil {
-					return nil, err
-				}
-				err = inserter.Add([]interface{}{
-					am.ID,
-					am.IdentifierType,
-					am.IdentifierValue,
-					am.RegistrationID,
-					statusToUint[core.StatusPending],
-					am.Expires,
-					am.Challenges,
-					nil,
-					nil,
-					am.Token,
-					nil,
-					nil,
-				})
-				if err != nil {
-					return nil, err
-				}
-			}
-			newAuthzIDs, err = inserter.Insert(ctx, tx)
-			if err != nil {
-				return nil, err
-			}
+	for _, authz := range req.NewAuthzs {
+		if authz.RegistrationID != req.NewOrder.RegistrationID {
+			// This is a belt-and-suspenders check. These were just created by the RA,
+			// so their RegIDs should match. But if they don't, the consequences would
+			// be very bad, so we do an extra check here.
+			return nil, errors.New("new order and authzs must all be associated with same account")
 		}
+	}
+
+	output, err := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (any, error) {
+		// First, insert all of the new authorizations and record their IDs.
+		newAuthzIDs := make([]int64, 0, len(req.NewAuthzs))
+		for _, authz := range req.NewAuthzs {
+			am, err := newAuthzReqToModel(authz, req.NewOrder.CertificateProfileName)
+			if err != nil {
+				return nil, err
+			}
+			err = tx.Insert(ctx, am)
+			if err != nil {
+				return nil, err
+			}
+			newAuthzIDs = append(newAuthzIDs, am.ID)
+		}
+
+		// Combine the already-existing and newly-created authzs.
+		allAuthzIds := append(req.NewOrder.V2Authorizations, newAuthzIDs...)
 
 		// Second, insert the new order.
-		var orderID int64
-		var err error
 		created := ssa.clk.Now()
-		if features.Get().MultipleCertificateProfiles {
-			omv2 := orderModelv2{
-				RegistrationID:         req.NewOrder.RegistrationID,
-				Expires:                req.NewOrder.Expires.AsTime(),
-				Created:                created,
-				CertificateProfileName: req.NewOrder.CertificateProfileName,
-			}
-			err = tx.Insert(ctx, &omv2)
-			orderID = omv2.ID
-		} else {
-			omv1 := orderModelv1{
-				RegistrationID: req.NewOrder.RegistrationID,
-				Expires:        req.NewOrder.Expires.AsTime(),
-				Created:        created,
-			}
-			err = tx.Insert(ctx, &omv1)
-			orderID = omv1.ID
-		}
+		encodedAuthzs, err := proto.Marshal(&sapb.Authzs{
+			AuthzIDs: allAuthzIds,
+		})
 		if err != nil {
 			return nil, err
 		}
 
-		// Third, insert all of the orderToAuthz relations.
-		inserter, err := db.NewMultiInserter("orderToAuthz2", []string{"orderID", "authzID"}, "")
+		om := orderModel{
+			RegistrationID:         req.NewOrder.RegistrationID,
+			Expires:                req.NewOrder.Expires.AsTime(),
+			Created:                created,
+			CertificateProfileName: &req.NewOrder.CertificateProfileName,
+			Replaces:               &req.NewOrder.Replaces,
+			Authzs:                 encodedAuthzs,
+		}
+		err = tx.Insert(ctx, &om)
 		if err != nil {
 			return nil, err
 		}
-		for _, id := range req.NewOrder.V2Authorizations {
-			err := inserter.Add([]interface{}{orderID, id})
-			if err != nil {
-				return nil, err
-			}
-		}
-		for _, id := range newAuthzIDs {
-			err := inserter.Add([]interface{}{orderID, id})
-			if err != nil {
-				return nil, err
-			}
-		}
-		_, err = inserter.Insert(ctx, tx)
-		if err != nil {
-			return nil, err
-		}
+		orderID := om.ID
 
 		// Fourth, insert the FQDNSet entry for the order.
-		err = addOrderFQDNSet(ctx, tx, req.NewOrder.Names, orderID, req.NewOrder.RegistrationID, req.NewOrder.Expires.AsTime())
+		err = addOrderFQDNSet(ctx, tx, identifier.FromProtoSlice(req.NewOrder.Identifiers), orderID, req.NewOrder.RegistrationID, req.NewOrder.Expires.AsTime())
 		if err != nil {
 			return nil, err
-		}
-
-		// Finally, build the overall Order PB.
-		res := &corepb.Order{
-			// ID and Created were auto-populated on the order model when it was inserted.
-			Id:      orderID,
-			Created: timestamppb.New(created),
-			// These are carried over from the original request unchanged.
-			RegistrationID: req.NewOrder.RegistrationID,
-			Expires:        req.NewOrder.Expires,
-			Names:          req.NewOrder.Names,
-			// Have to combine the already-associated and newly-reacted authzs.
-			V2Authorizations: append(req.NewOrder.V2Authorizations, newAuthzIDs...),
-			// A new order is never processing because it can't be finalized yet.
-			BeganProcessing: false,
-			// An empty string is allowed. When the RA retrieves the order and
-			// transmits it to the CA, the empty string will take the value of
-			// DefaultCertProfileName from the //issuance package.
-			CertificateProfileName: req.NewOrder.CertificateProfileName,
 		}
 
 		if req.NewOrder.ReplacesSerial != "" {
@@ -580,10 +530,30 @@ func (ssa *SQLStorageAuthority) NewOrderAndAuthzs(ctx context.Context, req *sapb
 		}
 
 		// Get the partial Authorization objects for the order
-		authzValidityInfo, err := getAuthorizationStatuses(ctx, tx, res.V2Authorizations)
+		authzValidityInfo, err := getAuthorizationStatuses(ctx, tx, allAuthzIds)
 		// If there was an error getting the authorizations, return it immediately
 		if err != nil {
 			return nil, err
+		}
+
+		// Finally, build the overall Order PB.
+		res := &corepb.Order{
+			// ID and Created were auto-populated on the order model when it was inserted.
+			Id:      orderID,
+			Created: timestamppb.New(created),
+			// These are carried over from the original request unchanged.
+			RegistrationID: req.NewOrder.RegistrationID,
+			Expires:        req.NewOrder.Expires,
+			Identifiers:    req.NewOrder.Identifiers,
+			// This includes both reused and newly created authz IDs.
+			V2Authorizations: allAuthzIds,
+			// A new order is never processing because it can't be finalized yet.
+			BeganProcessing: false,
+			// An empty string is allowed. When the RA retrieves the order and
+			// transmits it to the CA, the empty string will take the value of
+			// DefaultCertProfileName from the //issuance package.
+			CertificateProfileName: req.NewOrder.CertificateProfileName,
+			Replaces:               req.NewOrder.Replaces,
 		}
 
 		// Calculate the order status before returning it. Since it may have reused
@@ -605,12 +575,6 @@ func (ssa *SQLStorageAuthority) NewOrderAndAuthzs(ctx context.Context, req *sapb
 		return nil, fmt.Errorf("casting error in NewOrderAndAuthzs")
 	}
 
-	// Increment the order creation count
-	err = addNewOrdersRateLimit(ctx, ssa.dbMap, req.NewOrder.RegistrationID, ssa.clk.Now().Truncate(time.Minute))
-	if err != nil {
-		return nil, err
-	}
-
 	return order, nil
 }
 
@@ -621,7 +585,7 @@ func (ssa *SQLStorageAuthority) SetOrderProcessing(ctx context.Context, req *sap
 	if req.Id == 0 {
 		return nil, errIncompleteRequest
 	}
-	_, overallError := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (interface{}, error) {
+	_, overallError := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (any, error) {
 		result, err := tx.ExecContext(ctx, `
 		UPDATE orders
 		SET beganProcessing = ?
@@ -652,21 +616,22 @@ func (ssa *SQLStorageAuthority) SetOrderError(ctx context.Context, req *sapb.Set
 	if req.Id == 0 || req.Error == nil {
 		return nil, errIncompleteRequest
 	}
-	_, overallError := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (interface{}, error) {
-		om, err := orderToModelv2(&corepb.Order{
-			Id:    req.Id,
-			Error: req.Error,
-		})
-		if err != nil {
-			return nil, err
-		}
 
+	errJSON, err := json.Marshal(req.Error)
+	if err != nil {
+		return nil, err
+	}
+	if len(errJSON) > mediumBlobSize {
+		return nil, fmt.Errorf("error object is too large to store in the database")
+	}
+
+	_, overallError := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (any, error) {
 		result, err := tx.ExecContext(ctx, `
 		UPDATE orders
 		SET error = ?
 		WHERE id = ?`,
-			om.Error,
-			om.ID)
+			errJSON,
+			req.Id)
 		if err != nil {
 			return nil, berrors.InternalServerError("error updating order error field")
 		}
@@ -692,7 +657,7 @@ func (ssa *SQLStorageAuthority) FinalizeOrder(ctx context.Context, req *sapb.Fin
 	if req.Id == 0 || req.CertificateSerial == "" {
 		return nil, errIncompleteRequest
 	}
-	_, overallError := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (interface{}, error) {
+	_, overallError := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (any, error) {
 		result, err := tx.ExecContext(ctx, `
 		UPDATE orders
 		SET certificateSerial = ?
@@ -716,11 +681,9 @@ func (ssa *SQLStorageAuthority) FinalizeOrder(ctx context.Context, req *sapb.Fin
 			return nil, err
 		}
 
-		if features.Get().TrackReplacementCertificatesARI {
-			err = setReplacementOrderFinalized(ctx, tx, req.Id)
-			if err != nil {
-				return nil, err
-			}
+		err = setReplacementOrderFinalized(ctx, tx, req.Id)
+		if err != nil {
+			return nil, err
 		}
 
 		return nil, nil
@@ -735,8 +698,7 @@ func (ssa *SQLStorageAuthority) FinalizeOrder(ctx context.Context, req *sapb.Fin
 // the authorization is being moved to invalid the validationError field must be set. If the
 // authorization is being moved to valid the validationRecord and expires fields must be set.
 func (ssa *SQLStorageAuthority) FinalizeAuthorization2(ctx context.Context, req *sapb.FinalizeAuthorizationRequest) (*emptypb.Empty, error) {
-	// TODO(#7153): Check each value via core.IsAnyNilOrZero
-	if req.Status == "" || req.Attempted == "" || req.Id == 0 || core.IsAnyNilOrZero(req.Expires) {
+	if core.IsAnyNilOrZero(req.Status, req.Attempted, req.Id, req.Expires) {
 		return nil, errIncompleteRequest
 	}
 
@@ -789,7 +751,7 @@ func (ssa *SQLStorageAuthority) FinalizeAuthorization2(ctx context.Context, req 
 		val := req.AttemptedAt.AsTime()
 		attemptedTime = &val
 	}
-	params := map[string]interface{}{
+	params := map[string]any{
 		"status":           statusToUint[core.AcmeStatus(req.Status)],
 		"attempted":        challTypeToUint[req.Attempted],
 		"attemptedAt":      attemptedTime,
@@ -857,13 +819,15 @@ func addRevokedCertificate(ctx context.Context, tx db.Executor, req *sapb.Revoke
 
 // RevokeCertificate stores revocation information about a certificate. It will only store this
 // information if the certificate is not already marked as revoked.
+//
+// If ShardIdx is non-zero, RevokeCertificate also writes an entry for this certificate to
+// the revokedCertificates table, with the provided shard number.
 func (ssa *SQLStorageAuthority) RevokeCertificate(ctx context.Context, req *sapb.RevokeCertificateRequest) (*emptypb.Empty, error) {
-	// TODO(#7153): Check each value via core.IsAnyNilOrZero
-	if req.Serial == "" || req.IssuerID == 0 || core.IsAnyNilOrZero(req.Date) {
+	if core.IsAnyNilOrZero(req.Serial, req.IssuerID, req.Date, req.ShardIdx) {
 		return nil, errIncompleteRequest
 	}
 
-	_, overallError := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (interface{}, error) {
+	_, overallError := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (any, error) {
 		revokedDate := req.Date.AsTime()
 
 		res, err := tx.ExecContext(ctx,
@@ -891,11 +855,9 @@ func (ssa *SQLStorageAuthority) RevokeCertificate(ctx context.Context, req *sapb
 			return nil, berrors.AlreadyRevokedError("no certificate with serial %s and status other than %s", req.Serial, string(core.OCSPStatusRevoked))
 		}
 
-		if req.ShardIdx != 0 {
-			err = addRevokedCertificate(ctx, tx, req, revokedDate)
-			if err != nil {
-				return nil, err
-			}
+		err = addRevokedCertificate(ctx, tx, req, revokedDate)
+		if err != nil {
+			return nil, err
 		}
 
 		return nil, nil
@@ -912,15 +874,14 @@ func (ssa *SQLStorageAuthority) RevokeCertificate(ctx context.Context, req *sapb
 // cert is already revoked, if the new revocation reason is `KeyCompromise`,
 // and if the revokedDate is identical to the current revokedDate.
 func (ssa *SQLStorageAuthority) UpdateRevokedCertificate(ctx context.Context, req *sapb.RevokeCertificateRequest) (*emptypb.Empty, error) {
-	// TODO(#7153): Check each value via core.IsAnyNilOrZero
-	if req.Serial == "" || req.IssuerID == 0 || core.IsAnyNilOrZero(req.Date, req.Backdate) {
+	if core.IsAnyNilOrZero(req.Serial, req.IssuerID, req.Date, req.Backdate, req.ShardIdx) {
 		return nil, errIncompleteRequest
 	}
-	if req.Reason != ocsp.KeyCompromise {
+	if revocation.Reason(req.Reason) != revocation.KeyCompromise {
 		return nil, fmt.Errorf("cannot update revocation for any reason other than keyCompromise (1); got: %d", req.Reason)
 	}
 
-	_, overallError := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (interface{}, error) {
+	_, overallError := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (any, error) {
 		thisUpdate := req.Date.AsTime()
 		revokedDate := req.Backdate.AsTime()
 
@@ -929,11 +890,11 @@ func (ssa *SQLStorageAuthority) UpdateRevokedCertificate(ctx context.Context, re
 					revokedReason = ?,
 					ocspLastUpdated = ?
 				WHERE serial = ? AND status = ? AND revokedReason != ? AND revokedDate = ?`,
-			revocation.Reason(ocsp.KeyCompromise),
+			revocation.KeyCompromise,
 			thisUpdate,
 			req.Serial,
 			string(core.OCSPStatusRevoked),
-			revocation.Reason(ocsp.KeyCompromise),
+			revocation.KeyCompromise,
 			revokedDate,
 		)
 		if err != nil {
@@ -949,38 +910,37 @@ func (ssa *SQLStorageAuthority) UpdateRevokedCertificate(ctx context.Context, re
 			return nil, berrors.InternalServerError("no certificate with serial %s and revoked reason other than keyCompromise", req.Serial)
 		}
 
-		// Only update the revokedCertificates table if the revocation request
-		// specifies the CRL shard that this certificate belongs in. Our shards are
-		// one-indexed, so a ShardIdx of zero means no value was set.
-		if req.ShardIdx != 0 {
-			var rcm revokedCertModel
-			// Note: this query MUST be updated to enforce the same preconditions as
-			// the "UPDATE certificateStatus SET revokedReason..." above if this
-			// query ever becomes the first or only query in this transaction. We are
-			// currently relying on the query above to exit early if the certificate
-			// does not have an appropriate status.
-			err = tx.SelectOne(
-				ctx, &rcm, `SELECT * FROM revokedCertificates WHERE serial = ?`, req.Serial)
-			if db.IsNoRows(err) {
-				// TODO: Remove this fallback codepath once we know that all unexpired
-				// certs marked as revoked in the certificateStatus table have
-				// corresponding rows in the revokedCertificates table. That should be
-				// 90+ days after the RA starts sending ShardIdx in its
-				// RevokeCertificateRequest messages.
-				err = addRevokedCertificate(ctx, tx, req, revokedDate)
-				if err != nil {
-					return nil, err
-				}
-				return nil, nil
-			} else if err != nil {
-				return nil, fmt.Errorf("retrieving revoked certificate row: %w", err)
-			}
-
-			rcm.RevokedReason = revocation.Reason(ocsp.KeyCompromise)
-			_, err = tx.Update(ctx, &rcm)
+		var rcm revokedCertModel
+		// Note: this query MUST be updated to enforce the same preconditions as
+		// the "UPDATE certificateStatus SET revokedReason..." above if this
+		// query ever becomes the first or only query in this transaction. We are
+		// currently relying on the query above to exit early if the certificate
+		// does not have an appropriate status and revocation reason.
+		err = tx.SelectOne(
+			ctx, &rcm, `SELECT * FROM revokedCertificates WHERE serial = ?`, req.Serial)
+		if db.IsNoRows(err) {
+			// TODO: Remove this fallback codepath once we know that all unexpired
+			// certs marked as revoked in the certificateStatus table have
+			// corresponding rows in the revokedCertificates table. That should be
+			// 90+ days after the RA starts sending ShardIdx in its
+			// RevokeCertificateRequest messages.
+			err = addRevokedCertificate(ctx, tx, req, revokedDate)
 			if err != nil {
-				return nil, fmt.Errorf("updating revoked certificate row: %w", err)
+				return nil, err
 			}
+			return nil, nil
+		} else if err != nil {
+			return nil, fmt.Errorf("retrieving revoked certificate row: %w", err)
+		}
+
+		if rcm.ShardIdx != req.ShardIdx {
+			return nil, berrors.InternalServerError("mismatched shard index %d != %d", req.ShardIdx, rcm.ShardIdx)
+		}
+
+		rcm.RevokedReason = revocation.KeyCompromise
+		_, err = tx.Update(ctx, &rcm)
+		if err != nil {
+			return nil, fmt.Errorf("updating revoked certificate row: %w", err)
 		}
 
 		return nil, nil
@@ -1002,7 +962,7 @@ func (ssa *SQLStorageAuthority) AddBlockedKey(ctx context.Context, req *sapb.Add
 		return nil, errors.New("unknown source")
 	}
 	cols, qs := blockedKeysColumns, "?, ?, ?, ?"
-	vals := []interface{}{
+	vals := []any{
 		req.KeyHash,
 		req.Added.AsTime(),
 		sourceInt,
@@ -1066,7 +1026,7 @@ func (ssa *SQLStorageAuthority) LeaseCRLShard(ctx context.Context, req *sapb.Lea
 // leased or are previously-unknown indices are considered older than any other
 // shard. It returns an error if all shards for the issuer are already leased.
 func (ssa *SQLStorageAuthority) leaseOldestCRLShard(ctx context.Context, req *sapb.LeaseCRLShardRequest) (*sapb.LeaseCRLShardResponse, error) {
-	shardIdx, err := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (interface{}, error) {
+	shardIdx, err := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (any, error) {
 		var shards []*crlShardModel
 		_, err := tx.Select(
 			ctx,
@@ -1083,7 +1043,6 @@ func (ssa *SQLStorageAuthority) leaseOldestCRLShard(ctx context.Context, req *sa
 
 		// Determine which shard index we want to lease.
 		var shardIdx int
-		var needToInsert bool
 		if len(shards) < (int(req.MaxShardIdx + 1 - req.MinShardIdx)) {
 			// Some expected shards are missing (i.e. never-before-produced), so we
 			// pick one at random.
@@ -1099,7 +1058,17 @@ func (ssa *SQLStorageAuthority) leaseOldestCRLShard(ctx context.Context, req *sa
 				shardIdx = idx
 				break
 			}
-			needToInsert = true
+
+			_, err = tx.ExecContext(ctx,
+				`INSERT INTO crlShards (issuerID, idx, leasedUntil)
+					VALUES (?, ?, ?)`,
+				req.IssuerNameID,
+				shardIdx,
+				req.Until.AsTime(),
+			)
+			if err != nil {
+				return -1, fmt.Errorf("inserting selected shard: %w", err)
+			}
 		} else {
 			// We got all the shards we expect, so we pick the oldest unleased shard.
 			var oldest *crlShardModel
@@ -1117,33 +1086,28 @@ func (ssa *SQLStorageAuthority) leaseOldestCRLShard(ctx context.Context, req *sa
 				return -1, fmt.Errorf("issuer %d has no unleased shards in range %d-%d", req.IssuerNameID, req.MinShardIdx, req.MaxShardIdx)
 			}
 			shardIdx = oldest.Idx
-			needToInsert = false
-		}
 
-		if needToInsert {
-			_, err = tx.ExecContext(ctx,
-				`INSERT INTO crlShards (issuerID, idx, leasedUntil)
-					VALUES (?, ?, ?)`,
-				req.IssuerNameID,
-				shardIdx,
-				req.Until.AsTime(),
-			)
-			if err != nil {
-				return -1, fmt.Errorf("inserting selected shard: %w", err)
-			}
-		} else {
-			_, err = tx.ExecContext(ctx,
+			res, err := tx.ExecContext(ctx,
 				`UPDATE crlShards
 					SET leasedUntil = ?
 					WHERE issuerID = ?
 					AND idx = ?
+					AND leasedUntil = ?
 					LIMIT 1`,
 				req.Until.AsTime(),
 				req.IssuerNameID,
 				shardIdx,
+				oldest.LeasedUntil,
 			)
 			if err != nil {
 				return -1, fmt.Errorf("updating selected shard: %w", err)
+			}
+			rowsAffected, err := res.RowsAffected()
+			if err != nil {
+				return -1, fmt.Errorf("confirming update of selected shard: %w", err)
+			}
+			if rowsAffected != 1 {
+				return -1, errors.New("failed to lease shard")
 			}
 		}
 
@@ -1167,7 +1131,7 @@ func (ssa *SQLStorageAuthority) leaseSpecificCRLShard(ctx context.Context, req *
 		return nil, fmt.Errorf("request must identify a single shard index: %d != %d", req.MinShardIdx, req.MaxShardIdx)
 	}
 
-	_, err := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (interface{}, error) {
+	_, err := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (any, error) {
 		needToInsert := false
 		var shardModel crlShardModel
 		err := tx.SelectOne(ctx,
@@ -1200,18 +1164,27 @@ func (ssa *SQLStorageAuthority) leaseSpecificCRLShard(ctx context.Context, req *
 				return nil, fmt.Errorf("inserting selected shard: %w", err)
 			}
 		} else {
-			_, err = tx.ExecContext(ctx,
+			res, err := tx.ExecContext(ctx,
 				`UPDATE crlShards
 					SET leasedUntil = ?
 					WHERE issuerID = ?
 					AND idx = ?
+					AND leasedUntil = ?
 					LIMIT 1`,
 				req.Until.AsTime(),
 				req.IssuerNameID,
 				req.MinShardIdx,
+				shardModel.LeasedUntil,
 			)
 			if err != nil {
 				return nil, fmt.Errorf("updating selected shard: %w", err)
+			}
+			rowsAffected, err := res.RowsAffected()
+			if err != nil {
+				return -1, fmt.Errorf("confirming update of selected shard: %w", err)
+			}
+			if rowsAffected != 1 {
+				return -1, errors.New("failed to lease shard")
 			}
 		}
 
@@ -1229,7 +1202,10 @@ func (ssa *SQLStorageAuthority) leaseSpecificCRLShard(ctx context.Context, req *
 
 // UpdateCRLShard updates the thisUpdate and nextUpdate timestamps of a CRL
 // shard. It rejects the update if it would cause the thisUpdate timestamp to
-// move backwards. It does *not* reject the update if the shard is no longer
+// move backwards, but if thisUpdate would stay the same (for instance, multiple
+// CRL generations within a single second), it will succeed.
+//
+// It does *not* reject the update if the shard is no longer
 // leased: although this would be unexpected (because the lease timestamp should
 // be the same as the crl-updater's context expiration), it's not inherently a
 // sign of an update that should be skipped. It does reject the update if the
@@ -1248,13 +1224,13 @@ func (ssa *SQLStorageAuthority) UpdateCRLShard(ctx context.Context, req *sapb.Up
 		nextUpdate = &nut
 	}
 
-	_, err := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (interface{}, error) {
+	_, err := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (any, error) {
 		res, err := tx.ExecContext(ctx,
 			`UPDATE crlShards
 				SET thisUpdate = ?, nextUpdate = ?, leasedUntil = ?
 				WHERE issuerID = ?
 				AND idx = ?
-				AND (thisUpdate is NULL OR thisUpdate < ?)
+				AND (thisUpdate is NULL OR thisUpdate <= ?)
 				LIMIT 1`,
 			req.ThisUpdate.AsTime(),
 			nextUpdate,
@@ -1272,7 +1248,7 @@ func (ssa *SQLStorageAuthority) UpdateCRLShard(ctx context.Context, req *sapb.Up
 			return nil, err
 		}
 		if rowsAffected == 0 {
-			return nil, fmt.Errorf("unable to update shard %d for issuer %d", req.ShardIdx, req.IssuerNameID)
+			return nil, fmt.Errorf("unable to update shard %d for issuer %d; possibly because shard exists", req.ShardIdx, req.IssuerNameID)
 		}
 		if rowsAffected != 1 {
 			return nil, errors.New("update affected unexpected number of rows")
@@ -1284,4 +1260,312 @@ func (ssa *SQLStorageAuthority) UpdateCRLShard(ctx context.Context, req *sapb.Up
 	}
 
 	return &emptypb.Empty{}, nil
+}
+
+// PauseIdentifiers pauses a set of identifiers for the provided account. If an
+// identifier is currently paused, this is a no-op. If an identifier was
+// previously paused and unpaused, it will be repaused unless it was unpaused
+// less than two weeks ago. The response will indicate how many identifiers were
+// paused and how many were repaused. All work is accomplished in a transaction
+// to limit possible race conditions.
+func (ssa *SQLStorageAuthority) PauseIdentifiers(ctx context.Context, req *sapb.PauseRequest) (*sapb.PauseIdentifiersResponse, error) {
+	if core.IsAnyNilOrZero(req.RegistrationID, req.Identifiers) {
+		return nil, errIncompleteRequest
+	}
+
+	// Marshal the identifier now that we've crossed the RPC boundary.
+	idents, err := newIdentifierModelsFromPB(req.Identifiers)
+	if err != nil {
+		return nil, err
+	}
+
+	response := &sapb.PauseIdentifiersResponse{}
+	_, err = db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (any, error) {
+		for _, ident := range idents {
+			pauseError := func(op string, err error) error {
+				return fmt.Errorf("while %s identifier %s for registration ID %d: %w",
+					op, ident.Value, req.RegistrationID, err,
+				)
+			}
+
+			var entry pausedModel
+			err := tx.SelectOne(ctx, &entry, `
+			SELECT pausedAt, unpausedAt
+			FROM paused
+			WHERE
+				registrationID = ? AND
+				identifierType = ? AND
+				identifierValue = ?`,
+				req.RegistrationID,
+				ident.Type,
+				ident.Value,
+			)
+
+			switch {
+			case err != nil && !errors.Is(err, sql.ErrNoRows):
+				// Error querying the database.
+				return nil, pauseError("querying pause status for", err)
+
+			case err != nil && errors.Is(err, sql.ErrNoRows):
+				// Not currently or previously paused, insert a new pause record.
+				err = tx.Insert(ctx, &pausedModel{
+					RegistrationID: req.RegistrationID,
+					PausedAt:       ssa.clk.Now(),
+					identifierModel: identifierModel{
+						Type:  ident.Type,
+						Value: ident.Value,
+					},
+				})
+				if err != nil && !db.IsDuplicate(err) {
+					return nil, pauseError("pausing", err)
+				}
+
+				// Identifier successfully paused.
+				response.Paused++
+				continue
+
+			case entry.UnpausedAt == nil || entry.PausedAt.After(*entry.UnpausedAt):
+				// Identifier is already paused.
+				continue
+
+			case entry.UnpausedAt.After(ssa.clk.Now().Add(-14 * 24 * time.Hour)):
+				// Previously unpaused less than two weeks ago, skip this identifier.
+				continue
+
+			case entry.UnpausedAt.After(entry.PausedAt):
+				// Previously paused (and unpaused), repause the identifier.
+				_, err := tx.ExecContext(ctx, `
+				UPDATE paused
+				SET pausedAt = ?,
+				    unpausedAt = NULL
+				WHERE
+					registrationID = ? AND
+					identifierType = ? AND
+					identifierValue = ? AND
+					unpausedAt IS NOT NULL`,
+					ssa.clk.Now(),
+					req.RegistrationID,
+					ident.Type,
+					ident.Value,
+				)
+				if err != nil {
+					return nil, pauseError("repausing", err)
+				}
+
+				// Identifier successfully repaused.
+				response.Repaused++
+				continue
+
+			default:
+				// This indicates a database state which should never occur.
+				return nil, fmt.Errorf("impossible database state encountered while pausing identifier %s",
+					ident.Value,
+				)
+			}
+		}
+		return nil, nil
+	})
+	if err != nil {
+		// Error occurred during transaction.
+		return nil, err
+	}
+	return response, nil
+}
+
+// UnpauseAccount uses up to 5 iterations of UPDATE queries each with a LIMIT of
+// 10,000 to unpause up to 50,000 identifiers and returns a count of identifiers
+// unpaused. If the returned count is 50,000 there may be more paused identifiers.
+func (ssa *SQLStorageAuthority) UnpauseAccount(ctx context.Context, req *sapb.RegistrationID) (*sapb.Count, error) {
+	if core.IsAnyNilOrZero(req.Id) {
+		return nil, errIncompleteRequest
+	}
+
+	total := &sapb.Count{}
+
+	for range unpause.MaxBatches {
+		result, err := ssa.dbMap.ExecContext(ctx, `
+			UPDATE paused
+			SET unpausedAt = ?
+			WHERE
+				registrationID = ? AND
+				unpausedAt IS NULL
+			LIMIT ?`,
+			ssa.clk.Now(),
+			req.Id,
+			unpause.BatchSize,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+
+		total.Count += rowsAffected
+		if rowsAffected < unpause.BatchSize {
+			// Fewer than batchSize rows were updated, so we're done.
+			break
+		}
+	}
+
+	return total, nil
+}
+
+// AddRateLimitOverride adds a rate limit override to the database. If the
+// override already exists, it will be updated. If the override does not exist,
+// it will be inserted and enabled. If the override exists but has been
+// disabled, it will be updated but not be re-enabled. The status of the
+// override is returned in Enabled field of the response. To re-enable an
+// override, use the EnableRateLimitOverride method.
+func (ssa *SQLStorageAuthority) AddRateLimitOverride(ctx context.Context, req *sapb.AddRateLimitOverrideRequest) (*sapb.AddRateLimitOverrideResponse, error) {
+	if core.IsAnyNilOrZero(req, req.Override, req.Override.LimitEnum, req.Override.BucketKey, req.Override.Count, req.Override.Burst, req.Override.Period, req.Override.Comment) {
+		return nil, errIncompleteRequest
+	}
+
+	var inserted bool
+	var enabled bool
+	now := ssa.clk.Now()
+
+	_, err := db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (any, error) {
+		var alreadyEnabled bool
+		err := tx.SelectOne(ctx, &alreadyEnabled, `
+			SELECT enabled
+			  FROM overrides
+			 WHERE limitEnum = ? AND
+			       bucketKey = ?`,
+			req.Override.LimitEnum,
+			req.Override.BucketKey,
+		)
+
+		switch {
+		case err != nil && !db.IsNoRows(err):
+			// Error querying the database.
+			return nil, fmt.Errorf("querying override for rate limit %d and bucket key %s: %w",
+				req.Override.LimitEnum,
+				req.Override.BucketKey,
+				err,
+			)
+
+		case db.IsNoRows(err):
+			// Insert a new overrides row.
+			new := overrideModelForPB(req.Override, now, true)
+			err = tx.Insert(ctx, &new)
+			if err != nil {
+				return nil, fmt.Errorf("inserting override for rate limit %d and bucket key %s: %w",
+					req.Override.LimitEnum,
+					req.Override.BucketKey,
+					err,
+				)
+			}
+			inserted = true
+			enabled = true
+
+		default:
+			// Update the existing overrides row.
+			updated := overrideModelForPB(req.Override, now, alreadyEnabled)
+			_, err = tx.Update(ctx, &updated)
+			if err != nil {
+				return nil, fmt.Errorf("updating override for rate limit %d and bucket key %s override: %w",
+					req.Override.LimitEnum,
+					req.Override.BucketKey,
+					err,
+				)
+			}
+			inserted = false
+			enabled = alreadyEnabled
+		}
+		return nil, nil
+	})
+	if err != nil {
+		// Error occurred during transaction.
+		return nil, err
+	}
+	return &sapb.AddRateLimitOverrideResponse{Inserted: inserted, Enabled: enabled}, nil
+}
+
+// setRateLimitOverride sets the enabled field of a rate limit override to the
+// provided value and updates the updatedAt column. If the override does not
+// exist, a NotFoundError is returned. If the override exists but is already in
+// the requested state, this is a no-op.
+func (ssa *SQLStorageAuthority) setRateLimitOverride(ctx context.Context, limitEnum int64, bucketKey string, enabled bool) (*emptypb.Empty, error) {
+	overrideColumnsList, err := ssa.dbMap.ColumnsForModel(overrideModel{})
+	if err != nil {
+		// This should never happen, the model is registered at init time.
+		return nil, fmt.Errorf("getting columns for override model: %w", err)
+	}
+	overrideColumns := strings.Join(overrideColumnsList, ", ")
+	_, err = db.WithTransaction(ctx, ssa.dbMap, func(tx db.Executor) (any, error) {
+		var existing overrideModel
+		err := tx.SelectOne(ctx, &existing,
+			// Use SELECT FOR UPDATE to both verify the row exists and lock it
+			// for the duration of the transaction.
+			`SELECT `+overrideColumns+` FROM overrides
+			 WHERE limitEnum = ? AND
+			       bucketKey = ?
+			 FOR UPDATE`,
+			limitEnum,
+			bucketKey,
+		)
+		if err != nil {
+			if db.IsNoRows(err) {
+				return nil, berrors.NotFoundError(
+					"no rate limit override found for limit %d and bucket key %s",
+					limitEnum,
+					bucketKey,
+				)
+			}
+			return nil, fmt.Errorf("querying status of override for rate limit %d and bucket key %s: %w",
+				limitEnum,
+				bucketKey,
+				err,
+			)
+		}
+
+		if existing.Enabled == enabled {
+			// No-op
+			return nil, nil
+		}
+
+		// Update the existing overrides row.
+		updated := existing
+		updated.Enabled = enabled
+		updated.UpdatedAt = ssa.clk.Now()
+
+		_, err = tx.Update(ctx, &updated)
+		if err != nil {
+			return nil, fmt.Errorf("updating status of override for rate limit %d and bucket key %s to %t: %w",
+				limitEnum,
+				bucketKey,
+				enabled,
+				err,
+			)
+		}
+		return nil, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &emptypb.Empty{}, nil
+}
+
+// DisableRateLimitOverride disables a rate limit override. If the override does
+// not exist, a NotFoundError is returned. If the override exists but is already
+// disabled, this is a no-op.
+func (ssa *SQLStorageAuthority) DisableRateLimitOverride(ctx context.Context, req *sapb.DisableRateLimitOverrideRequest) (*emptypb.Empty, error) {
+	if core.IsAnyNilOrZero(req, req.LimitEnum, req.BucketKey) {
+		return nil, errIncompleteRequest
+	}
+	return ssa.setRateLimitOverride(ctx, req.LimitEnum, req.BucketKey, false)
+}
+
+// EnableRateLimitOverride enables a rate limit override. If the override does
+// not exist, a NotFoundError is returned. If the override exists but is already
+// enabled, this is a no-op.
+func (ssa *SQLStorageAuthority) EnableRateLimitOverride(ctx context.Context, req *sapb.EnableRateLimitOverrideRequest) (*emptypb.Empty, error) {
+	if core.IsAnyNilOrZero(req, req.LimitEnum, req.BucketKey) {
+		return nil, errIncompleteRequest
+	}
+	return ssa.setRateLimitOverride(ctx, req.LimitEnum, req.BucketKey, true)
 }

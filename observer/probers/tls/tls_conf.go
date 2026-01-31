@@ -2,12 +2,16 @@ package probers
 
 import (
 	"fmt"
+	"net"
 	"net/url"
+	"slices"
+	"strconv"
 	"strings"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/letsencrypt/boulder/observer/probers"
 	"github.com/letsencrypt/boulder/strictyaml"
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 const (
@@ -42,15 +46,28 @@ func (c TLSConf) UnmarshalSettings(settings []byte) (probers.Configurer, error) 
 }
 
 func (c TLSConf) validateHostname() error {
-	url, err := url.Parse(c.Hostname)
+	hostname := c.Hostname
+
+	if strings.Contains(c.Hostname, ":") {
+		host, port, err := net.SplitHostPort(c.Hostname)
+		if err != nil {
+			return fmt.Errorf("invalid 'hostname', got %q, expected a valid hostport: %s", c.Hostname, err)
+		}
+
+		_, err = strconv.Atoi(port)
+		if err != nil {
+			return fmt.Errorf("invalid 'hostname', got %q, expected a valid hostport: %s", c.Hostname, err)
+		}
+		hostname = host
+	}
+
+	url, err := url.Parse(hostname)
 	if err != nil {
-		return fmt.Errorf(
-			"invalid 'hostname', got %q, expected a valid hostname: %s", c.Hostname, err)
+		return fmt.Errorf("invalid 'hostname', got %q, expected a valid hostname: %s", c.Hostname, err)
 	}
 
 	if url.Scheme != "" {
-		return fmt.Errorf(
-			"invalid 'hostname', got: %q, should not include scheme", c.Hostname)
+		return fmt.Errorf("invalid 'hostname', got: %q, should not include scheme", c.Hostname)
 	}
 
 	return nil
@@ -58,10 +75,8 @@ func (c TLSConf) validateHostname() error {
 
 func (c TLSConf) validateResponse() error {
 	acceptable := []string{"valid", "expired", "revoked"}
-	for _, a := range acceptable {
-		if strings.ToLower(c.Response) == a {
-			return nil
-		}
+	if slices.Contains(acceptable, strings.ToLower(c.Response)) {
+		return nil
 	}
 
 	return fmt.Errorf(
@@ -120,7 +135,7 @@ func (c TLSConf) MakeProber(collectors map[string]prometheus.Collector) (probers
 
 // Instrument constructs any `prometheus.Collector` objects the `TLSProbe` will
 // need to report its own metrics. A map is returned containing the constructed
-// objects, indexed by the name of the Promtheus metric.  If no objects were
+// objects, indexed by the name of the Prometheus metric.  If no objects were
 // constructed, nil is returned.
 func (c TLSConf) Instrument() map[string]prometheus.Collector {
 	notBefore := prometheus.Collector(prometheus.NewGaugeVec(

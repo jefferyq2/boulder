@@ -8,8 +8,8 @@ import "google/protobuf/timestamp.proto";
 
 // CertificateAuthority issues certificates.
 service CertificateAuthority {
-  rpc IssuePrecertificate(IssueCertificateRequest) returns (IssuePrecertificateResponse) {}
-  rpc IssueCertificateForPrecertificate(IssueCertificateForPrecertificateRequest) returns (core.Certificate) {}
+  // IssueCertificate issues a precertificate, gets SCTs, issues a certificate, and returns that.
+  rpc IssueCertificate(IssueCertificateRequest) returns (IssueCertificateResponse) {}
 }
 
 message IssueCertificateRequest {
@@ -26,55 +26,8 @@ message IssueCertificateRequest {
   string certProfileName = 5;
 }
 
-message IssuePrecertificateResponse {
-  // Next unused field number: 4
+message IssueCertificateResponse {
   bytes DER = 1;
-
-  // certProfileHash is a hash over the exported fields of a certificate profile
-  // to ensure that the profile remains unchanged after multiple roundtrips
-  // through the RA and CA.
-  bytes certProfileHash = 2;
-
-  // certProfileName is a human readable name returned back to the RA for later
-  // use. If IssueCertificateRequest.certProfileName was an empty string, the
-  // CAs default profile name will be assigned.
-  string certProfileName = 3;
-}
-
-message IssueCertificateForPrecertificateRequest {
-  // Next unused field number: 6
-  bytes DER = 1;
-  repeated bytes SCTs = 2;
-  int64 registrationID = 3;
-  int64 orderID = 4;
-
-  // certProfileHash is a hash over the exported fields of a certificate profile
-  // to ensure that the profile remains unchanged after multiple roundtrips
-  // through the RA and CA.
-  bytes certProfileHash = 5;
-}
-
-// OCSPGenerator generates OCSP. We separate this out from
-// CertificateAuthority so that we can restrict access to a different subset of
-// hosts, so the hosts that need to request OCSP generation don't need to be
-// able to request certificate issuance.
-service OCSPGenerator {
-  rpc GenerateOCSP(GenerateOCSPRequest) returns (OCSPResponse) {}
-}
-
-// Exactly one of certDER or [serial and issuerID] must be set.
-message GenerateOCSPRequest {
-  // Next unused field number: 8
-  string status = 2;
-  int32 reason = 3;
-  reserved 4; // Previously revokedAtNS
-  google.protobuf.Timestamp revokedAt = 7;
-  string serial = 5;
-  int64 issuerID = 6;
-}
-
-message OCSPResponse {
-  bytes response = 1;
 }
 
 // CRLGenerator signs CRLs. It is separated for the same reason as OCSPGenerator.

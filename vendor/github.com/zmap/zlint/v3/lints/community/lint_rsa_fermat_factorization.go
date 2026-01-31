@@ -1,7 +1,7 @@
 package community
 
 /*
- * ZLint Copyright 2023 Regents of the University of Michigan
+ * ZLint Copyright 2024 Regents of the University of Michigan
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not
  * use this file except in compliance with the License. You may obtain a copy
@@ -61,7 +61,7 @@ func (l *fermatFactorization) Execute(c *x509.Certificate) *lint.LintResult {
 	if err != nil {
 		return &lint.LintResult{
 			Status:  lint.Error,
-			Details: fmt.Sprintf("this certificate's RSA key pair is susceptible to Fermat factorization, %s", err.Error())}
+			Details: "this certificate's RSA key pair is susceptible to Fermat factorization, " + err.Error()}
 	} else {
 		return &lint.LintResult{Status: lint.Pass}
 	}

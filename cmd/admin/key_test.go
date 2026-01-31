@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
@@ -28,24 +30,37 @@ import (
 	"github.com/letsencrypt/boulder/test"
 )
 
-func TestSPKIHashFromPrivateKey(t *testing.T) {
-	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	test.AssertNotError(t, err, "creating test private key")
-	keyHash, err := core.KeyDigest(privKey.Public())
-	test.AssertNotError(t, err, "computing test SPKI hash")
+func TestSPKIHashesFromPrivateKeys(t *testing.T) {
 
-	keyBytes, err := x509.MarshalPKCS8PrivateKey(privKey)
-	test.AssertNotError(t, err, "marshalling test private key bytes")
+	ecdsaKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	test.AssertNotError(t, err, "Generating ECDSA key")
+	pkcs8ecdsa, err := x509.MarshalPKCS8PrivateKey(ecdsaKey)
+	test.AssertNotError(t, err, "Marshalling PKCS8 private key")
+
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	test.AssertNotError(t, err, "Generating RSA key")
+	pkcs8rsa, err := x509.MarshalPKCS8PrivateKey(rsaKey)
+	test.AssertNotError(t, err, "Marshalling PKCS8 private key")
+	pkcs1rsa := x509.MarshalPKCS1PrivateKey(rsaKey)
+
 	keyFile := path.Join(t.TempDir(), "key.pem")
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: keyBytes})
-	err = os.WriteFile(keyFile, keyPEM, os.ModeAppend)
-	test.AssertNotError(t, err, "writing test private key file")
+	file, err := os.Create(keyFile)
+	test.AssertNotError(t, err, "Creating key file")
+	test.AssertNotError(t, pem.Encode(file, &pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8ecdsa}), "encoding PEM")
+	test.AssertNotError(t, pem.Encode(file, &pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8rsa}), "encoding PEM")
+	test.AssertNotError(t, pem.Encode(file, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: pkcs1rsa}), "encoding PEM")
+	test.AssertNotError(t, file.Close(), "writing test private key file")
 
 	a := admin{}
 
-	res, err := a.spkiHashFromPrivateKey(keyFile)
-	test.AssertNotError(t, err, "")
-	test.AssertByteEquals(t, res, keyHash[:])
+	res, err := a.spkiHashesFromPrivateKeys(keyFile)
+	test.AssertNotError(t, err, "getting hashes from private key")
+
+	for i, pubkey := range []crypto.PublicKey{&ecdsaKey.PublicKey, &rsaKey.PublicKey, &rsaKey.PublicKey} {
+		expectedHash, err := core.KeyDigest(pubkey)
+		test.AssertNotError(t, err, "hashing public key")
+		test.AssertByteEquals(t, res[i], expectedHash[:])
+	}
 }
 
 func TestSPKIHashesFromFile(t *testing.T) {
@@ -68,6 +83,53 @@ func TestSPKIHashesFromFile(t *testing.T) {
 	}
 }
 
+// The key is the p256 test key from RFC9500
+const goodCSR = `
+-----BEGIN CERTIFICATE REQUEST-----
+MIG6MGICAQAwADBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABEIlSPiPt4L/teyj
+dERSxyoeVY+9b3O+XkjpMjLMRcWxbEzRDEy41bihcTnpSILImSVymTQl9BQZq36Q
+pCpJQnKgADAKBggqhkjOPQQDAgNIADBFAiBadw3gvL9IjUfASUTa7MvmkbC4ZCvl
+21m1KMwkIx/+CQIhAKvuyfCcdZ0cWJYOXCOb1OavolWHIUzgEpNGUWul6O0s
+-----END CERTIFICATE REQUEST-----
+`
+
+// TestCSR checks that we get the correct SPKI from a CSR, even if its signature is invalid
+func TestCSR(t *testing.T) {
+	expectedSPKIHash := "b2b04340cfaee616ec9c2c62d261b208e54bb197498df52e8cadede23ac0ba5e"
+
+	goodCSRFile := path.Join(t.TempDir(), "good.csr")
+	err := os.WriteFile(goodCSRFile, []byte(goodCSR), 0600)
+	test.AssertNotError(t, err, "writing good csr")
+
+	a := admin{log: blog.NewMock()}
+
+	goodHash, err := a.spkiHashFromCSRPEM(goodCSRFile, true, "")
+	test.AssertNotError(t, err, "expected to read CSR")
+
+	if len(goodHash) != 1 {
+		t.Fatalf("expected to read 1 SPKI from CSR, read %d", len(goodHash))
+	}
+	test.AssertEquals(t, hex.EncodeToString(goodHash[0]), expectedSPKIHash)
+
+	// Flip a bit, in the signature, to make a bad CSR:
+	badCSR := strings.Replace(goodCSR, "Wul6", "Wul7", 1)
+
+	csrFile := path.Join(t.TempDir(), "bad.csr")
+	err = os.WriteFile(csrFile, []byte(badCSR), 0600)
+	test.AssertNotError(t, err, "writing bad csr")
+
+	_, err = a.spkiHashFromCSRPEM(csrFile, true, "")
+	test.AssertError(t, err, "expected invalid signature")
+
+	badHash, err := a.spkiHashFromCSRPEM(csrFile, false, "")
+	test.AssertNotError(t, err, "expected to read CSR with bad signature")
+
+	if len(badHash) != 1 {
+		t.Fatalf("expected to read 1 SPKI from CSR, read %d", len(badHash))
+	}
+	test.AssertEquals(t, hex.EncodeToString(badHash[0]), expectedSPKIHash)
+}
+
 // mockSARecordingBlocks is a mock which only implements the AddBlockedKey gRPC
 // method.
 type mockSARecordingBlocks struct {
@@ -86,6 +148,18 @@ func (msa *mockSARecordingBlocks) reset() {
 	msa.blockRequests = nil
 }
 
+type mockSARO struct {
+	sapb.StorageAuthorityReadOnlyClient
+}
+
+func (sa *mockSARO) GetSerialsByKey(ctx context.Context, _ *sapb.SPKIHash, _ ...grpc.CallOption) (grpc.ServerStreamingClient[sapb.Serial], error) {
+	return &mocks.ServerStreamClient[sapb.Serial]{}, nil
+}
+
+func (sa *mockSARO) KeyBlocked(ctx context.Context, req *sapb.SPKIHash, _ ...grpc.CallOption) (*sapb.Exists, error) {
+	return &sapb.Exists{Exists: false}, nil
+}
+
 func TestBlockSPKIHash(t *testing.T) {
 	fc := clock.NewFake()
 	fc.Set(time.Now())
@@ -97,13 +171,12 @@ func TestBlockSPKIHash(t *testing.T) {
 	keyHash, err := core.KeyDigest(privKey.Public())
 	test.AssertNotError(t, err, "computing test SPKI hash")
 
-	a := admin{saroc: &mocks.StorageAuthorityReadOnly{}, sac: &msa, clk: fc, log: log}
+	a := admin{saroc: &mockSARO{}, sac: &msa, clk: fc, log: log}
 	u := &user.User{}
 
 	// A full run should result in one request with the right fields.
 	msa.reset()
 	log.Clear()
-	a.dryRun = false
 	err = a.blockSPKIHash(context.Background(), keyHash[:], u, "hello world")
 	test.AssertNotError(t, err, "")
 	test.AssertEquals(t, len(log.GetAllMatching("Found 0 unexpired certificates")), 1)
@@ -114,11 +187,10 @@ func TestBlockSPKIHash(t *testing.T) {
 	// A dry-run should result in zero requests and two log lines.
 	msa.reset()
 	log.Clear()
-	a.dryRun = true
 	a.sac = dryRunSAC{log: log}
 	err = a.blockSPKIHash(context.Background(), keyHash[:], u, "")
 	test.AssertNotError(t, err, "")
 	test.AssertEquals(t, len(log.GetAllMatching("Found 0 unexpired certificates")), 1)
-	test.AssertEquals(t, len(log.GetAllMatching("dry-run:")), 1)
+	test.AssertEquals(t, len(log.GetAllMatching("dry-run: Block SPKI hash "+hex.EncodeToString(keyHash[:]))), 1)
 	test.AssertEquals(t, len(msa.blockRequests), 0)
 }

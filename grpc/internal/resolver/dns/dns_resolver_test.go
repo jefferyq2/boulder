@@ -48,7 +48,6 @@ func TestMain(m *testing.M) {
 }
 
 const (
-	txtBytesLimit           = 255
 	defaultTestTimeout      = 10 * time.Second
 	defaultTestShortTimeout = 10 * time.Millisecond
 )
@@ -600,7 +599,7 @@ func TestCustomAuthority(t *testing.T) {
 
 			err = <-errChan
 			if err != nil {
-				t.Errorf(err.Error())
+				t.Error(err.Error())
 			}
 
 			if a.expectError {

@@ -1,5 +1,5 @@
 /*
- * ZLint Copyright 2023 Regents of the University of Michigan
+ * ZLint Copyright 2024 Regents of the University of Michigan
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not
  * use this file except in compliance with the License. You may obtain a copy
@@ -15,7 +15,6 @@
 package rfc
 
 import (
-	"fmt"
 	"sort"
 	"strings"
 
@@ -90,9 +89,8 @@ func (l *ecdsaInvalidKU) Execute(c *x509.Certificate) *lint.LintResult {
 		sort.Strings(invalidKUs)
 		return &lint.LintResult{
 			Status: lint.Notice,
-			Details: fmt.Sprintf(
-				"Certificate had unexpected key usage(s): %s",
-				strings.Join(invalidKUs, ", ")),
+			Details: "Certificate had unexpected key usage(s): " +
+				strings.Join(invalidKUs, ", "),
 		}
 	}
 

@@ -5,7 +5,6 @@ package main
 
 import (
 	"crypto/ecdsa"
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -13,7 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"strings"
@@ -41,7 +40,7 @@ type integrationSrv struct {
 	userAgent     string
 }
 
-func readJSON(r *http.Request, output interface{}) error {
+func readJSON(r *http.Request, output any) error {
 	if r.Method != "POST" {
 		return fmt.Errorf("incorrect method; only POST allowed")
 	}
@@ -161,7 +160,7 @@ func (is *integrationSrv) addChainOrPre(w http.ResponseWriter, r *http.Request, 
 	is.submissions[hostnames]++
 	is.Unlock()
 
-	if is.flakinessRate != 0 && rand.Intn(100) < is.flakinessRate {
+	if is.flakinessRate != 0 && rand.IntN(100) < is.flakinessRate {
 		time.Sleep(10 * time.Second)
 	}
 
@@ -211,10 +210,6 @@ func runPersonality(p Personality) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	pubKeyBytes, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
-	if err != nil {
-		log.Fatal(err)
-	}
 	is := integrationSrv{
 		key:           key,
 		flakinessRate: p.FlakinessRate,
@@ -228,16 +223,10 @@ func runPersonality(p Personality) {
 	m.HandleFunc("/ct/v1/add-chain", is.addChain)
 	m.HandleFunc("/add-reject-host", is.addRejectHost)
 	m.HandleFunc("/get-rejections", is.getRejections)
-	// The gosec linter complains that ReadHeaderTimeout is not set. That's fine,
-	// because this is test-only code.
-	////nolint:gosec
-	srv := &http.Server{
+	srv := &http.Server{ //nolint: gosec // No ReadHeaderTimeout is fine for test-only code.
 		Addr:    p.Addr,
 		Handler: m,
 	}
-	logID := sha256.Sum256(pubKeyBytes)
-	log.Printf("ct-test-srv on %s with pubkey %s and log ID %s", p.Addr,
-		base64.StdEncoding.EncodeToString(pubKeyBytes), base64.StdEncoding.EncodeToString(logID[:]))
 	log.Fatal(srv.ListenAndServe())
 }
 

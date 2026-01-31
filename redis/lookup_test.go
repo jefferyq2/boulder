@@ -14,9 +14,9 @@ import (
 )
 
 func newTestRedisRing() *redis.Ring {
-	CACertFile := "../test/redis-tls/minica.pem"
-	CertFile := "../test/redis-tls/boulder/cert.pem"
-	KeyFile := "../test/redis-tls/boulder/key.pem"
+	CACertFile := "../test/certs/ipki/minica.pem"
+	CertFile := "../test/certs/ipki/localhost/cert.pem"
+	KeyFile := "../test/certs/ipki/localhost/key.pem"
 	tlsConfig := cmd.TLSConfig{
 		CACertFile: CACertFile,
 		CertFile:   CertFile,
@@ -28,7 +28,7 @@ func newTestRedisRing() *redis.Ring {
 	}
 
 	client := redis.NewRing(&redis.RingOptions{
-		Username:  "unittest-rw",
+		Username:  "boulder",
 		Password:  "824968fa490f4ecec1e52d5e34916bdb60d45f8d",
 		TLSConfig: tlsConfig2,
 	})
@@ -161,10 +161,7 @@ func TestUpdateNowWithAllFailingSRV(t *testing.T) {
 		},
 	}
 
-	testCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	tempErr, nonTempErr := lookup.updateNow(testCtx)
+	tempErr, nonTempErr := lookup.updateNow(t.Context())
 	test.AssertNotError(t, tempErr, "Expected no temporary errors")
 	test.AssertError(t, nonTempErr, "Expected non-temporary errors to have occurred")
 }
@@ -194,9 +191,7 @@ func TestUpdateNowWithAllFailingSRVs(t *testing.T) {
 	// eventually result in a non-temporary error when no shards are resolved.
 	lookup.dnsAuthority = "consuls.services.consuls:53"
 
-	testCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	tempErr, nonTempErr := lookup.updateNow(testCtx)
+	tempErr, nonTempErr := lookup.updateNow(t.Context())
 	test.AssertError(t, tempErr, "Expected temporary errors")
 	test.AssertError(t, nonTempErr, "Expected a non-temporary error")
 	test.AssertErrorIs(t, nonTempErr, ErrNoShardsResolved)
@@ -230,8 +225,7 @@ func TestUpdateNowWithOneFailingSRV(t *testing.T) {
 	// two SRV targets. We should only have two shards in the ring.
 	test.Assert(t, ring.Len() == 2, "Expected 2 shards in the ring")
 
-	testCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	testCtx := t.Context()
 
 	// Ensure we can reach both shards using the PING command.
 	err = ring.ForEachShard(testCtx, func(ctx context.Context, shard *redis.Client) error {

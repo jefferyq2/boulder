@@ -6,21 +6,58 @@ import (
 	"os"
 	"time"
 
+	"github.com/jmhodges/clock"
+
 	"github.com/letsencrypt/boulder/bdns"
 	"github.com/letsencrypt/boulder/cmd"
+	"github.com/letsencrypt/boulder/config"
 	"github.com/letsencrypt/boulder/features"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
+	"github.com/letsencrypt/boulder/iana"
 	"github.com/letsencrypt/boulder/va"
 	vaConfig "github.com/letsencrypt/boulder/va/config"
 	vapb "github.com/letsencrypt/boulder/va/proto"
 )
 
+// RemoteVAGRPCClientConfig  contains the information necessary to setup a gRPC
+// client connection. The following GRPC client configuration field combinations
+// are allowed:
+//
+// ServerAddress, DNSAuthority, [Timeout], [HostOverride]
+// SRVLookup, DNSAuthority, [Timeout], [HostOverride], [SRVResolver]
+// SRVLookups, DNSAuthority, [Timeout], [HostOverride], [SRVResolver]
+type RemoteVAGRPCClientConfig struct {
+	cmd.GRPCClientConfig
+	// Perspective uniquely identifies the Network Perspective used to
+	// perform the validation, as specified in BRs Section 5.4.1,
+	// Requirement 2.7 ("Multi-Perspective Issuance Corroboration attempts
+	// from each Network Perspective"). It should uniquely identify a group
+	// of RVAs deployed in the same datacenter.
+	Perspective string `validate:"required"`
+
+	// RIR indicates the Regional Internet Registry where this RVA is
+	// located. This field is used to identify the RIR region from which a
+	// given validation was performed, as specified in the "Phased
+	// Implementation Timeline" in BRs Section 3.2.2.9. It must be one of
+	// the following values:
+	//   - ARIN
+	//   - RIPE
+	//   - APNIC
+	//   - LACNIC
+	//   - AFRINIC
+	RIR string `validate:"required,oneof=ARIN RIPE APNIC LACNIC AFRINIC"`
+}
+
 type Config struct {
 	VA struct {
 		vaConfig.Common
-		RemoteVAs                   []cmd.GRPCClientConfig `validate:"omitempty,dive"`
-		MaxRemoteValidationFailures int                    `validate:"omitempty,min=0,required_with=RemoteVAs"`
-		Features                    features.Config
+		RemoteVAs []RemoteVAGRPCClientConfig `validate:"omitempty,dive"`
+		// SlowRemoteTimeout sets how long the VA is willing to wait for slow
+		// RemoteVA instances to finish their work. It starts counting from
+		// when the VA first gets a quorum of (un)successful remote results.
+		// Leaving this value zero means the VA won't early-cancel slow remotes.
+		SlowRemoteTimeout config.Duration
+		Features          features.Config
 	}
 
 	Syslog        cmd.SyslogConfig
@@ -46,20 +83,16 @@ func main() {
 	features.Set(c.VA.Features)
 	scope, logger, oTelShutdown := cmd.StatsAndLogging(c.Syslog, c.OpenTelemetry, c.VA.DebugAddr)
 	defer oTelShutdown(context.Background())
-	logger.Info(cmd.VersionString())
-	clk := cmd.Clock()
+	cmd.LogStartup(logger)
+	clk := clock.New()
 
 	var servers bdns.ServerProvider
-	proto := "udp"
-	if features.Get().DOH {
-		proto = "tcp"
-	}
 
 	if len(c.VA.DNSStaticResolvers) != 0 {
 		servers, err = bdns.NewStaticProvider(c.VA.DNSStaticResolvers)
 		cmd.FailOnError(err, "Couldn't start static DNS server resolver")
 	} else {
-		servers, err = bdns.StartDynamicProvider(c.VA.DNSProvider, 60*time.Second, proto)
+		servers, err = bdns.StartDynamicProvider(c.VA.DNSProvider, 60*time.Second, "tcp")
 		cmd.FailOnError(err, "Couldn't start dynamic DNS server resolver")
 	}
 	defer servers.Stop()
@@ -67,31 +100,20 @@ func main() {
 	tlsConfig, err := c.VA.TLS.Load(scope)
 	cmd.FailOnError(err, "tlsConfig config")
 
-	var resolver bdns.Client
-	if !c.VA.DNSAllowLoopbackAddresses {
-		resolver = bdns.New(
-			c.VA.DNSTimeout.Duration,
-			servers,
-			scope,
-			clk,
-			c.VA.DNSTries,
-			logger,
-			tlsConfig)
-	} else {
-		resolver = bdns.NewTest(
-			c.VA.DNSTimeout.Duration,
-			servers,
-			scope,
-			clk,
-			c.VA.DNSTries,
-			logger,
-			tlsConfig)
-	}
+	resolver := bdns.New(
+		c.VA.DNSTimeout.Duration,
+		servers,
+		scope,
+		clk,
+		c.VA.DNSTries,
+		c.VA.UserAgent,
+		logger,
+		tlsConfig)
+
 	var remotes []va.RemoteVA
 	if len(c.VA.RemoteVAs) > 0 {
 		for _, rva := range c.VA.RemoteVAs {
-			rva := rva
-			vaConn, err := bgrpc.ClientSetup(&rva, tlsConfig, scope, clk)
+			vaConn, err := bgrpc.ClientSetup(&rva.GRPCClientConfig, tlsConfig, scope, clk)
 			cmd.FailOnError(err, "Unable to create remote VA client")
 			remotes = append(
 				remotes,
@@ -100,7 +122,9 @@ func main() {
 						VAClient:  vapb.NewVAClient(vaConn),
 						CAAClient: vapb.NewCAAClient(vaConn),
 					},
-					Address: rva.ServerAddress,
+					Address:     rva.ServerAddress,
+					Perspective: rva.Perspective,
+					RIR:         rva.RIR,
 				},
 			)
 		}
@@ -109,13 +133,18 @@ func main() {
 	vai, err := va.NewValidationAuthorityImpl(
 		resolver,
 		remotes,
-		c.VA.MaxRemoteValidationFailures,
 		c.VA.UserAgent,
 		c.VA.IssuerDomain,
 		scope,
 		clk,
 		logger,
-		c.VA.AccountURIPrefixes)
+		c.VA.AccountURIPrefixes,
+		va.PrimaryPerspective,
+		"",
+		iana.IsReservedAddr,
+		c.VA.SlowRemoteTimeout.Duration,
+		c.VA.DNSAllowLoopbackAddresses,
+	)
 	cmd.FailOnError(err, "Unable to create VA server")
 
 	start, err := bgrpc.NewServer(c.VA.GRPC, logger).Add(

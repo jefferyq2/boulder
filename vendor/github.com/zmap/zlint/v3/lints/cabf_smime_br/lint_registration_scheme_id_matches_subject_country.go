@@ -1,5 +1,5 @@
 /*
- * ZLint Copyright 2023 Regents of the University of Michigan
+ * ZLint Copyright 2024 Regents of the University of Michigan
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not
  * use this file except in compliance with the License. You may obtain a copy
@@ -15,7 +15,7 @@
 package cabf_smime_br
 
 import (
-	"fmt"
+	"errors"
 	"regexp"
 
 	"github.com/zmap/zcrypto/x509"
@@ -99,7 +99,7 @@ func verifySMIMEOrganizationIdentifierContainsSubjectNameCountry(id string, coun
 	identifierCountry := submatches[2]
 
 	if identifierCountry != country {
-		return fmt.Errorf("the country code used in the Registration Scheme identifier SHALL match that of the subject:countryName")
+		return errors.New("the country code used in the Registration Scheme identifier SHALL match that of the subject:countryName")
 	}
 
 	return nil

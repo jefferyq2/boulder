@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -13,8 +12,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
+
+	"github.com/miekg/dns"
 
 	"github.com/letsencrypt/boulder/core"
 	berrors "github.com/letsencrypt/boulder/errors"
@@ -56,28 +58,48 @@ func certAltNames(cert *x509.Certificate) []string {
 	return names
 }
 
-func (va *ValidationAuthorityImpl) tryGetChallengeCert(ctx context.Context,
-	identifier identifier.ACMEIdentifier, challenge core.Challenge,
-	tlsConfig *tls.Config) (*x509.Certificate, *tls.ConnectionState, core.ValidationRecord, error) {
-
-	allAddrs, resolvers, err := va.getAddrs(ctx, identifier.Value)
+func (va *ValidationAuthorityImpl) tryGetChallengeCert(
+	ctx context.Context,
+	ident identifier.ACMEIdentifier,
+) (*x509.Certificate, *tls.ConnectionState, core.ValidationRecord, error) {
 	validationRecord := core.ValidationRecord{
-		Hostname:          identifier.Value,
-		AddressesResolved: allAddrs,
-		Port:              strconv.Itoa(va.tlsPort),
-		ResolverAddrs:     resolvers,
+		Hostname: ident.Value,
+		Port:     strconv.Itoa(va.tlsPort),
 	}
-	if err != nil {
-		return nil, nil, validationRecord, err
+
+	var addrs []netip.Addr
+	switch ident.Type {
+	case identifier.TypeDNS:
+		// Resolve IP addresses for the identifier
+		dnsAddrs, dnsResolvers, err := va.getAddrs(ctx, ident.Value)
+		if err != nil {
+			return nil, nil, validationRecord, err
+		}
+		addrs, validationRecord.ResolverAddrs = dnsAddrs, dnsResolvers
+		validationRecord.AddressesResolved = addrs
+	case identifier.TypeIP:
+		netIP, err := netip.ParseAddr(ident.Value)
+		if err != nil {
+			return nil, nil, validationRecord, fmt.Errorf("can't parse IP address %q: %s", ident.Value, err)
+		}
+		addrs = []netip.Addr{netIP}
+		// This field shouldn't be necessary: it's redundant with the Hostname
+		// field. But Challenge.RecordsSane expects it, and there's no easy way to
+		// special-case IP identifiers within that function.
+		validationRecord.AddressesResolved = addrs
+	default:
+		// This should never happen. The calling function should check the
+		// identifier type.
+		return nil, nil, validationRecord, fmt.Errorf("unknown identifier type: %s", ident.Type)
 	}
 
 	// Split the available addresses into v4 and v6 addresses
-	v4, v6 := availableAddresses(allAddrs)
+	v4, v6 := availableAddresses(addrs)
 	addresses := append(v4, v6...)
 
 	// This shouldn't happen, but be defensive about it anyway
 	if len(addresses) < 1 {
-		return nil, nil, validationRecord, berrors.MalformedError("no IP addresses found for %q", identifier.Value)
+		return nil, nil, validationRecord, berrors.MalformedError("no IP addresses found for %q", ident.Value)
 	}
 
 	// If there is at least one IPv6 address then try it first
@@ -85,7 +107,7 @@ func (va *ValidationAuthorityImpl) tryGetChallengeCert(ctx context.Context,
 		address := net.JoinHostPort(v6[0].String(), validationRecord.Port)
 		validationRecord.AddressUsed = v6[0]
 
-		cert, cs, err := va.getChallengeCert(ctx, address, identifier, challenge, tlsConfig)
+		cert, cs, err := va.getChallengeCert(ctx, address, ident)
 
 		// If there is no problem, return immediately
 		if err == nil {
@@ -111,35 +133,69 @@ func (va *ValidationAuthorityImpl) tryGetChallengeCert(ctx context.Context,
 	// Otherwise if there are no IPv6 addresses, or there was an error
 	// talking to the first IPv6 address, try the first IPv4 address
 	validationRecord.AddressUsed = v4[0]
-	cert, cs, err := va.getChallengeCert(ctx, net.JoinHostPort(v4[0].String(), validationRecord.Port),
-		identifier, challenge, tlsConfig)
+	address := net.JoinHostPort(v4[0].String(), validationRecord.Port)
+	cert, cs, err := va.getChallengeCert(ctx, address, ident)
 	return cert, cs, validationRecord, err
 }
 
 func (va *ValidationAuthorityImpl) getChallengeCert(
 	ctx context.Context,
 	hostPort string,
-	identifier identifier.ACMEIdentifier,
-	challenge core.Challenge,
-	config *tls.Config,
+	ident identifier.ACMEIdentifier,
 ) (*x509.Certificate, *tls.ConnectionState, error) {
-	va.log.Info(fmt.Sprintf("%s [%s] Attempting to validate for %s %s", challenge.Type, identifier, hostPort, config.ServerName))
-	// We expect a self-signed challenge certificate, do not verify it here.
-	config.InsecureSkipVerify = true
+	var serverName string
+	switch ident.Type {
+	case identifier.TypeDNS:
+		serverName = ident.Value
+	case identifier.TypeIP:
+		reverseIP, err := dns.ReverseAddr(ident.Value)
+		if err != nil {
+			va.log.Infof("%s Failed to parse IP address %s.", core.ChallengeTypeTLSALPN01, ident.Value)
+			return nil, nil, fmt.Errorf("failed to parse IP address")
+		}
+		serverName = reverseIP
+	default:
+		// This should never happen. The calling function should check the
+		// identifier type.
+		va.log.Infof("%s Unknown identifier type '%s' for %s.", core.ChallengeTypeTLSALPN01, ident.Type, ident.Value)
+		return nil, nil, fmt.Errorf("unknown identifier type: %s", ident.Type)
+	}
+
+	va.log.Infof("%s [%s] Attempting to validate for %s %s", core.ChallengeTypeTLSALPN01, ident, hostPort, serverName)
 
 	dialCtx, cancel := context.WithTimeout(ctx, va.singleDialTimeout)
 	defer cancel()
 
-	dialer := &tls.Dialer{Config: config}
+	dialer := &tls.Dialer{Config: &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{ACMETLS1Protocol},
+		ServerName: serverName,
+		// We expect a self-signed challenge certificate, do not verify it here.
+		InsecureSkipVerify: true,
+	}}
+
+	// This is a backstop check to avoid connecting to reserved IP addresses.
+	// They should have been caught and excluded by `bdns.LookupHost`.
+	host, _, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		return nil, nil, err
+	}
+	hostIP, _ := netip.ParseAddr(host)
+	if (hostIP != netip.Addr{}) {
+		err = va.isReservedIPFunc(hostIP)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
 	conn, err := dialer.DialContext(dialCtx, "tcp", hostPort)
 	if err != nil {
-		va.log.Infof("%s connection failure for %s. err=[%#v] errStr=[%s]", challenge.Type, identifier, err, err)
-		host, _, splitErr := net.SplitHostPort(hostPort)
-		if splitErr == nil && net.ParseIP(host) != nil {
+		va.log.Infof("%s connection failure for %s. err=[%#v] errStr=[%s]", core.ChallengeTypeTLSALPN01, ident, err, err)
+		if (hostIP != netip.Addr{}) {
 			// Wrap the validation error and the IP of the remote host in an
 			// IPError so we can display the IP in the problem details returned
 			// to the client.
-			return nil, nil, ipError{net.ParseIP(host), err}
+			return nil, nil, ipError{hostIP, err}
 		}
 		return nil, nil, err
 	}
@@ -149,34 +205,67 @@ func (va *ValidationAuthorityImpl) getChallengeCert(
 	cs := conn.(*tls.Conn).ConnectionState()
 	certs := cs.PeerCertificates
 	if len(certs) == 0 {
-		va.log.Infof("%s challenge for %s resulted in no certificates", challenge.Type, identifier.Value)
-		return nil, nil, berrors.UnauthorizedError("No certs presented for %s challenge", challenge.Type)
+		va.log.Infof("%s challenge for %s resulted in no certificates", core.ChallengeTypeTLSALPN01, ident.Value)
+		return nil, nil, berrors.UnauthorizedError("No certs presented for %s challenge", core.ChallengeTypeTLSALPN01)
 	}
 	for i, cert := range certs {
-		va.log.AuditInfof("%s challenge for %s received certificate (%d of %d): cert=[%s]",
-			challenge.Type, identifier.Value, i+1, len(certs), hex.EncodeToString(cert.Raw))
+		va.log.Infof("%s challenge for %s received certificate (%d of %d): cert=[%s]",
+			core.ChallengeTypeTLSALPN01, ident.Value, i+1, len(certs), hex.EncodeToString(cert.Raw))
 	}
 	return certs[0], &cs, nil
 }
 
-func checkExpectedSAN(cert *x509.Certificate, name identifier.ACMEIdentifier) error {
-	if len(cert.DNSNames) != 1 {
-		return errors.New("wrong number of dNSNames")
+func checkExpectedSAN(cert *x509.Certificate, ident identifier.ACMEIdentifier) error {
+	var expectedSANBytes []byte
+	switch ident.Type {
+	case identifier.TypeDNS:
+		if len(cert.DNSNames) != 1 || len(cert.IPAddresses) != 0 {
+			return errors.New("wrong number of identifiers")
+		}
+		if !strings.EqualFold(cert.DNSNames[0], ident.Value) {
+			return errors.New("identifier does not match expected identifier")
+		}
+		bytes, err := asn1.Marshal([]asn1.RawValue{
+			{Tag: 2, Class: 2, Bytes: []byte(ident.Value)},
+		})
+		if err != nil {
+			return fmt.Errorf("composing SAN extension: %w", err)
+		}
+		expectedSANBytes = bytes
+	case identifier.TypeIP:
+		if len(cert.IPAddresses) != 1 || len(cert.DNSNames) != 0 {
+			return errors.New("wrong number of identifiers")
+		}
+		if !cert.IPAddresses[0].Equal(net.ParseIP(ident.Value)) {
+			return errors.New("identifier does not match expected identifier")
+		}
+		netipAddr, err := netip.ParseAddr(ident.Value)
+		if err != nil {
+			return fmt.Errorf("parsing IP address identifier: %w", err)
+		}
+		netipBytes, err := netipAddr.MarshalBinary()
+		if err != nil {
+			return fmt.Errorf("marshalling IP address identifier: %w", err)
+		}
+		bytes, err := asn1.Marshal([]asn1.RawValue{
+			{Tag: 7, Class: 2, Bytes: netipBytes},
+		})
+		if err != nil {
+			return fmt.Errorf("composing SAN extension: %w", err)
+		}
+		expectedSANBytes = bytes
+	default:
+		// This should never happen. The calling function should check the
+		// identifier type.
+		return fmt.Errorf("unknown identifier type: %s", ident.Type)
 	}
 
 	for _, ext := range cert.Extensions {
 		if IdCeSubjectAltName.Equal(ext.Id) {
-			expectedSANs, err := asn1.Marshal([]asn1.RawValue{
-				{Tag: 2, Class: 2, Bytes: []byte(cert.DNSNames[0])},
-			})
-			if err != nil || !bytes.Equal(expectedSANs, ext.Value) {
+			if !bytes.Equal(ext.Value, expectedSANBytes) {
 				return errors.New("SAN extension does not match expected bytes")
 			}
 		}
-	}
-
-	if !strings.EqualFold(cert.DNSNames[0], name.Value) {
-		return errors.New("dNSName does not match expected identifier")
 	}
 
 	return nil
@@ -204,23 +293,19 @@ func checkAcceptableExtensions(exts []pkix.Extension, requiredOIDs []asn1.Object
 	return nil
 }
 
-func (va *ValidationAuthorityImpl) validateTLSALPN01(ctx context.Context, identifier identifier.ACMEIdentifier, challenge core.Challenge) ([]core.ValidationRecord, error) {
-	if identifier.Type != "dns" {
-		va.log.Info(fmt.Sprintf("Identifier type for TLS-ALPN-01 was not DNS: %s", identifier))
-		return nil, berrors.MalformedError("Identifier type for TLS-ALPN-01 was not DNS")
+func (va *ValidationAuthorityImpl) validateTLSALPN01(ctx context.Context, ident identifier.ACMEIdentifier, keyAuthorization string) ([]core.ValidationRecord, error) {
+	if ident.Type != identifier.TypeDNS && ident.Type != identifier.TypeIP {
+		va.log.Infof("Identifier type for TLS-ALPN-01 challenge was not DNS or IP: %s", ident)
+		return nil, berrors.MalformedError("Identifier type for TLS-ALPN-01 challenge was not DNS or IP")
 	}
 
-	cert, cs, tvr, problem := va.tryGetChallengeCert(ctx, identifier, challenge, &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		NextProtos: []string{ACMETLS1Protocol},
-		ServerName: identifier.Value,
-	})
+	cert, cs, tvr, err := va.tryGetChallengeCert(ctx, ident)
 	// Copy the single validationRecord into the slice that we have to return, and
 	// get a reference to it so we can modify it if we have to.
 	validationRecords := []core.ValidationRecord{tvr}
 	validationRecord := &validationRecords[0]
-	if problem != nil {
-		return validationRecords, problem
+	if err != nil {
+		return validationRecords, err
 	}
 
 	if cs.NegotiatedProtocol != ACMETLS1Protocol {
@@ -236,11 +321,11 @@ func (va *ValidationAuthorityImpl) validateTLSALPN01(ctx context.Context, identi
 		return berrors.UnauthorizedError(
 			"Incorrect validation certificate for %s challenge. "+
 				"Requested %s from %s. %s",
-			challenge.Type, identifier.Value, hostPort, msg)
+			core.ChallengeTypeTLSALPN01, ident.Value, hostPort, msg)
 	}
 
 	// The certificate must be self-signed.
-	err := cert.CheckSignature(cert.SignatureAlgorithm, cert.RawTBSCertificate, cert.Signature)
+	err = cert.CheckSignature(cert.SignatureAlgorithm, cert.RawTBSCertificate, cert.Signature)
 	if err != nil || !bytes.Equal(cert.RawSubject, cert.RawIssuer) {
 		return validationRecords, badCertErr(
 			"Received certificate which is not self-signed.")
@@ -258,8 +343,8 @@ func (va *ValidationAuthorityImpl) validateTLSALPN01(ctx context.Context, identi
 	}
 
 	// The certificate returned must have a subjectAltName extension containing
-	// only the dNSName being validated and no other entries.
-	err = checkExpectedSAN(cert, identifier)
+	// only the identifier being validated and no other entries.
+	err = checkExpectedSAN(cert, ident)
 	if err != nil {
 		names := strings.Join(certAltNames(cert), ", ")
 		return validationRecords, badCertErr(
@@ -267,7 +352,7 @@ func (va *ValidationAuthorityImpl) validateTLSALPN01(ctx context.Context, identi
 	}
 
 	// Verify key authorization in acmeValidation extension
-	h := sha256.Sum256([]byte(challenge.ProvidedKeyAuthorization))
+	h := sha256.Sum256([]byte(keyAuthorization))
 	for _, ext := range cert.Extensions {
 		if IdPeAcmeIdentifier.Equal(ext.Id) {
 			va.metrics.tlsALPNOIDCounter.WithLabelValues(IdPeAcmeIdentifier.String()).Inc()
@@ -281,17 +366,13 @@ func (va *ValidationAuthorityImpl) validateTLSALPN01(ctx context.Context, identi
 				return validationRecords, badCertErr(
 					"Received certificate with malformed acmeValidationV1 extension value.")
 			}
-			if subtle.ConstantTimeCompare(h[:], extValue) != 1 {
+			if !bytes.Equal(h[:], extValue) {
 				return validationRecords, badCertErr(fmt.Sprintf(
 					"Received certificate with acmeValidationV1 extension value %s but expected %s.",
 					hex.EncodeToString(extValue),
 					hex.EncodeToString(h[:]),
 				))
 			}
-			// We were successful, so record the negotiated key exchange mechanism in
-			// the validationRecord.
-			// TODO(#7321): Remove this when we have collected enough data.
-			validationRecord.UsedRSAKEX = usedRSAKEX(cs.CipherSuite)
 			return validationRecords, nil
 		}
 	}

@@ -9,14 +9,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"google.golang.org/protobuf/proto"
 	"math"
-	"net"
+	"net/netip"
 	"net/url"
-	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/letsencrypt/boulder/core"
@@ -59,52 +61,10 @@ func badJSONError(msg string, jsonData []byte, err error) error {
 	}
 }
 
-const regFields = "id, jwk, jwk_sha256, contact, agreement, initialIP, createdAt, LockCol, status"
-
-// ClearEmail removes the provided email address from one specified registration. If
-// there are multiple email addresses present, it does not modify other ones. If the email
-// address is not present, it does not modify the registration and will return a nil error.
-func ClearEmail(ctx context.Context, dbMap db.DatabaseMap, regID int64, email string) error {
-	_, overallError := db.WithTransaction(ctx, dbMap, func(tx db.Executor) (interface{}, error) {
-		curr, err := selectRegistration(ctx, tx, "id", regID)
-		if err != nil {
-			return nil, err
-		}
-
-		currPb, err := registrationModelToPb(curr)
-		if err != nil {
-			return nil, err
-		}
-
-		// newContacts will be a copy of all emails in currPb.Contact _except_ the one to be removed
-		var newContacts []string
-		for _, contact := range currPb.Contact {
-			if contact != "mailto:"+email {
-				newContacts = append(newContacts, contact)
-			}
-		}
-
-		if slices.Equal(currPb.Contact, newContacts) {
-			return nil, nil
-		}
-
-		currPb.Contact = newContacts
-		newModel, err := registrationPbToModel(currPb)
-		if err != nil {
-			return nil, err
-		}
-
-		return tx.Update(ctx, newModel)
-	})
-	if overallError != nil {
-		return overallError
-	}
-
-	return nil
-}
+const regFields = "id, jwk, jwk_sha256, agreement, createdAt, status"
 
 // selectRegistration selects all fields of one registration model
-func selectRegistration(ctx context.Context, s db.OneSelector, whereCol string, args ...interface{}) (*regModel, error) {
+func selectRegistration(ctx context.Context, s db.OneSelector, whereCol string, args ...any) (*regModel, error) {
 	if whereCol != "id" && whereCol != "jwk_sha256" {
 		return nil, fmt.Errorf("column name %q invalid for registrations table WHERE clause", whereCol)
 	}
@@ -119,65 +79,59 @@ func selectRegistration(ctx context.Context, s db.OneSelector, whereCol string, 
 	return &model, err
 }
 
-const certFields = "registrationID, serial, digest, der, issued, expires"
+const certFields = "id, registrationID, serial, digest, der, issued, expires"
 
 // SelectCertificate selects all fields of one certificate object identified by
 // a serial. If more than one row contains the same serial only the first is
 // returned.
-func SelectCertificate(ctx context.Context, s db.OneSelector, serial string) (core.Certificate, error) {
-	var model core.Certificate
+func SelectCertificate(ctx context.Context, s db.OneSelector, serial string) (*corepb.Certificate, error) {
+	var model certificateModel
 	err := s.SelectOne(
 		ctx,
 		&model,
 		"SELECT "+certFields+" FROM certificates WHERE serial = ? LIMIT 1",
 		serial,
 	)
-	return model, err
+	return model.toPb(), err
 }
 
 const precertFields = "registrationID, serial, der, issued, expires"
 
 // SelectPrecertificate selects all fields of one precertificate object
 // identified by serial.
-func SelectPrecertificate(ctx context.Context, s db.OneSelector, serial string) (core.Certificate, error) {
-	var model precertificateModel
+func SelectPrecertificate(ctx context.Context, s db.OneSelector, serial string) (*corepb.Certificate, error) {
+	var model lintingCertModel
 	err := s.SelectOne(
 		ctx,
 		&model,
 		"SELECT "+precertFields+" FROM precertificates WHERE serial = ? LIMIT 1",
 		serial)
-	return core.Certificate{
-		RegistrationID: model.RegistrationID,
-		Serial:         model.Serial,
-		DER:            model.DER,
-		Issued:         model.Issued,
-		Expires:        model.Expires,
-	}, err
-}
-
-type CertWithID struct {
-	ID int64
-	core.Certificate
+	if err != nil {
+		return nil, err
+	}
+	return model.toPb(), nil
 }
 
 // SelectCertificates selects all fields of multiple certificate objects
-func SelectCertificates(ctx context.Context, s db.Selector, q string, args map[string]interface{}) ([]CertWithID, error) {
-	var models []CertWithID
+//
+// Returns a slice of *corepb.Certificate along with the highest ID field seen
+// (which can be used as input to a subsequent query when iterating in primary
+// key order).
+func SelectCertificates(ctx context.Context, s db.Selector, q string, args map[string]any) ([]*corepb.Certificate, int64, error) {
+	var models []certificateModel
 	_, err := s.Select(
 		ctx,
 		&models,
-		"SELECT id, "+certFields+" FROM certificates "+q, args)
-	return models, err
-}
-
-// SelectPrecertificates selects all fields of multiple precertificate objects.
-func SelectPrecertificates(ctx context.Context, s db.Selector, q string, args map[string]interface{}) ([]CertWithID, error) {
-	var models []CertWithID
-	_, err := s.Select(
-		ctx,
-		&models,
-		"SELECT id, "+precertFields+" FROM precertificates "+q, args)
-	return models, err
+		"SELECT "+certFields+" FROM certificates "+q, args)
+	var pbs []*corepb.Certificate
+	var highestID int64
+	for _, m := range models {
+		pbs = append(pbs, m.toPb())
+		if m.ID > highestID {
+			highestID = m.ID
+		}
+	}
+	return pbs, highestID, err
 }
 
 type CertStatusMetadata struct {
@@ -197,15 +151,15 @@ const certStatusFields = "id, serial, status, ocspLastUpdated, revokedDate, revo
 
 // SelectCertificateStatus selects all fields of one certificate status model
 // identified by serial
-func SelectCertificateStatus(ctx context.Context, s db.OneSelector, serial string) (core.CertificateStatus, error) {
-	var model core.CertificateStatus
+func SelectCertificateStatus(ctx context.Context, s db.OneSelector, serial string) (*corepb.CertificateStatus, error) {
+	var model certificateStatusModel
 	err := s.SelectOne(
 		ctx,
 		&model,
 		"SELECT "+certStatusFields+" FROM certificateStatus WHERE serial = ? LIMIT 1",
 		serial,
 	)
-	return model, err
+	return model.toPb(), err
 }
 
 // RevocationStatusModel represents a small subset of the columns in the
@@ -254,17 +208,12 @@ type issuedNameModel struct {
 
 // regModel is the description of a core.Registration in the database before
 type regModel struct {
-	ID        int64  `db:"id"`
-	Key       []byte `db:"jwk"`
-	KeySHA256 string `db:"jwk_sha256"`
-	Contact   string `db:"contact"`
-	Agreement string `db:"agreement"`
-	// InitialIP is stored as sixteen binary bytes, regardless of whether it
-	// represents a v4 or v6 IP address.
-	InitialIP []byte    `db:"initialIp"`
+	ID        int64     `db:"id"`
+	Key       []byte    `db:"jwk"`
+	KeySHA256 string    `db:"jwk_sha256"`
+	Agreement string    `db:"agreement"`
 	CreatedAt time.Time `db:"createdAt"`
-	LockCol   int64
-	Status    string `db:"status"`
+	Status    string    `db:"status"`
 }
 
 func registrationPbToModel(reg *corepb.Registration) (*regModel, error) {
@@ -281,27 +230,6 @@ func registrationPbToModel(reg *corepb.Registration) (*regModel, error) {
 		return nil, err
 	}
 
-	// We don't want to write literal JSON "null" strings into the database if the
-	// list of contact addresses is empty. Replace any possibly-`nil` slice with
-	// an empty JSON array. We don't need to check reg.ContactPresent, because
-	// we're going to write the whole object to the database anyway.
-	jsonContact := []byte("[]")
-	if len(reg.Contact) != 0 {
-		jsonContact, err = json.Marshal(reg.Contact)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// For some reason we use different serialization formats for InitialIP
-	// in database models and in protobufs, despite the fact that both formats
-	// are just []byte.
-	var initialIP net.IP
-	err = initialIP.UnmarshalText(reg.InitialIP)
-	if err != nil {
-		return nil, err
-	}
-
 	var createdAt time.Time
 	if !core.IsAnyNilOrZero(reg.CreatedAt) {
 		createdAt = reg.CreatedAt.AsTime()
@@ -311,48 +239,23 @@ func registrationPbToModel(reg *corepb.Registration) (*regModel, error) {
 		ID:        reg.Id,
 		Key:       reg.Key,
 		KeySHA256: sha,
-		Contact:   string(jsonContact),
 		Agreement: reg.Agreement,
-		InitialIP: []byte(initialIP.To16()),
 		CreatedAt: createdAt,
 		Status:    reg.Status,
 	}, nil
 }
 
 func registrationModelToPb(reg *regModel) (*corepb.Registration, error) {
-	if reg.ID == 0 || len(reg.Key) == 0 || len(reg.InitialIP) == 0 {
+	if reg.ID == 0 || len(reg.Key) == 0 {
 		return nil, errors.New("incomplete Registration retrieved from DB")
 	}
 
-	contact := []string{}
-	contactsPresent := false
-	if len(reg.Contact) > 0 {
-		err := json.Unmarshal([]byte(reg.Contact), &contact)
-		if err != nil {
-			return nil, err
-		}
-		if len(contact) > 0 {
-			contactsPresent = true
-		}
-	}
-
-	// For some reason we use different serialization formats for InitialIP
-	// in database models and in protobufs, despite the fact that both formats
-	// are just []byte.
-	ipBytes, err := net.IP(reg.InitialIP).MarshalText()
-	if err != nil {
-		return nil, err
-	}
-
 	return &corepb.Registration{
-		Id:              reg.ID,
-		Key:             reg.Key,
-		Contact:         contact,
-		ContactsPresent: contactsPresent,
-		Agreement:       reg.Agreement,
-		InitialIP:       ipBytes,
-		CreatedAt:       timestamppb.New(reg.CreatedAt.UTC()),
-		Status:          reg.Status,
+		Id:        reg.ID,
+		Key:       reg.Key,
+		Agreement: reg.Agreement,
+		CreatedAt: timestamppb.New(reg.CreatedAt.UTC()),
+		Status:    reg.Status,
 	}, nil
 }
 
@@ -364,7 +267,7 @@ type recordedSerialModel struct {
 	Expires        time.Time
 }
 
-type precertificateModel struct {
+type lintingCertModel struct {
 	ID             int64
 	Serial         string
 	RegistrationID int64
@@ -373,18 +276,68 @@ type precertificateModel struct {
 	Expires        time.Time
 }
 
-// TODO(#7324) orderModelv1 is deprecated, use orderModelv2 moving forward.
-type orderModelv1 struct {
-	ID                int64
-	RegistrationID    int64
-	Expires           time.Time
-	Created           time.Time
-	Error             []byte
-	CertificateSerial string
-	BeganProcessing   bool
+func (model lintingCertModel) toPb() *corepb.Certificate {
+	return &corepb.Certificate{
+		RegistrationID: model.RegistrationID,
+		Serial:         model.Serial,
+		Digest:         "",
+		Der:            model.DER,
+		Issued:         timestamppb.New(model.Issued),
+		Expires:        timestamppb.New(model.Expires),
+	}
 }
 
-type orderModelv2 struct {
+type certificateModel struct {
+	ID             int64     `db:"id"`
+	RegistrationID int64     `db:"registrationID"`
+	Serial         string    `db:"serial"`
+	Digest         string    `db:"digest"`
+	DER            []byte    `db:"der"`
+	Issued         time.Time `db:"issued"`
+	Expires        time.Time `db:"expires"`
+}
+
+func (model certificateModel) toPb() *corepb.Certificate {
+	return &corepb.Certificate{
+		RegistrationID: model.RegistrationID,
+		Serial:         model.Serial,
+		Digest:         model.Digest,
+		Der:            model.DER,
+		Issued:         timestamppb.New(model.Issued),
+		Expires:        timestamppb.New(model.Expires),
+	}
+}
+
+type certificateStatusModel struct {
+	ID                    int64             `db:"id"`
+	Serial                string            `db:"serial"`
+	Status                core.OCSPStatus   `db:"status"`
+	OCSPLastUpdated       time.Time         `db:"ocspLastUpdated"`
+	RevokedDate           time.Time         `db:"revokedDate"`
+	RevokedReason         revocation.Reason `db:"revokedReason"`
+	LastExpirationNagSent time.Time         `db:"lastExpirationNagSent"`
+	NotAfter              time.Time         `db:"notAfter"`
+	IsExpired             bool              `db:"isExpired"`
+	IssuerID              int64             `db:"issuerID"`
+}
+
+func (model certificateStatusModel) toPb() *corepb.CertificateStatus {
+	return &corepb.CertificateStatus{
+		Serial:                model.Serial,
+		Status:                string(model.Status),
+		OcspLastUpdated:       timestamppb.New(model.OCSPLastUpdated),
+		RevokedDate:           timestamppb.New(model.RevokedDate),
+		RevokedReason:         int64(model.RevokedReason),
+		LastExpirationNagSent: timestamppb.New(model.LastExpirationNagSent),
+		NotAfter:              timestamppb.New(model.NotAfter),
+		IsExpired:             model.IsExpired,
+		IssuerID:              model.IssuerID,
+	}
+}
+
+// orderModel represents one row in the orders table. The CertificateProfileName
+// column is a pointer because the column is NULL-able.
+type orderModel struct {
 	ID                     int64
 	RegistrationID         int64
 	Expires                time.Time
@@ -392,87 +345,29 @@ type orderModelv2 struct {
 	Error                  []byte
 	CertificateSerial      string
 	BeganProcessing        bool
-	CertificateProfileName string
+	CertificateProfileName *string
+	Replaces               *string
+	Authzs                 []byte
 }
 
-type orderToAuthzModel struct {
-	OrderID int64
-	AuthzID int64
-}
-
-// TODO(#7324) orderToModelv1 is deprecated, use orderModelv2 moving forward.
-func orderToModelv1(order *corepb.Order) (*orderModelv1, error) {
-	om := &orderModelv1{
-		ID:                order.Id,
-		RegistrationID:    order.RegistrationID,
-		Expires:           order.Expires.AsTime(),
-		Created:           order.Created.AsTime(),
-		BeganProcessing:   order.BeganProcessing,
-		CertificateSerial: order.CertificateSerial,
+func modelToOrder(om *orderModel) (*corepb.Order, error) {
+	profile := ""
+	if om.CertificateProfileName != nil {
+		profile = *om.CertificateProfileName
 	}
-
-	if order.Error != nil {
-		errJSON, err := json.Marshal(order.Error)
+	replaces := ""
+	if om.Replaces != nil {
+		replaces = *om.Replaces
+	}
+	var v2Authorizations []int64
+	if len(om.Authzs) > 0 {
+		var decodedAuthzs sapb.Authzs
+		err := proto.Unmarshal(om.Authzs, &decodedAuthzs)
 		if err != nil {
 			return nil, err
 		}
-		if len(errJSON) > mediumBlobSize {
-			return nil, fmt.Errorf("Error object is too large to store in the database")
-		}
-		om.Error = errJSON
+		v2Authorizations = decodedAuthzs.AuthzIDs
 	}
-	return om, nil
-}
-
-// TODO(#7324) modelToOrderv1 is deprecated, use orderModelv2 moving forward.
-func modelToOrderv1(om *orderModelv1) (*corepb.Order, error) {
-	order := &corepb.Order{
-		Id:                om.ID,
-		RegistrationID:    om.RegistrationID,
-		Expires:           timestamppb.New(om.Expires),
-		Created:           timestamppb.New(om.Created),
-		CertificateSerial: om.CertificateSerial,
-		BeganProcessing:   om.BeganProcessing,
-	}
-	if len(om.Error) > 0 {
-		var problem corepb.ProblemDetails
-		err := json.Unmarshal(om.Error, &problem)
-		if err != nil {
-			return &corepb.Order{}, badJSONError(
-				"failed to unmarshal order model's error",
-				om.Error,
-				err)
-		}
-		order.Error = &problem
-	}
-	return order, nil
-}
-
-func orderToModelv2(order *corepb.Order) (*orderModelv2, error) {
-	om := &orderModelv2{
-		ID:                     order.Id,
-		RegistrationID:         order.RegistrationID,
-		Expires:                order.Expires.AsTime(),
-		Created:                order.Created.AsTime(),
-		BeganProcessing:        order.BeganProcessing,
-		CertificateSerial:      order.CertificateSerial,
-		CertificateProfileName: order.CertificateProfileName,
-	}
-
-	if order.Error != nil {
-		errJSON, err := json.Marshal(order.Error)
-		if err != nil {
-			return nil, err
-		}
-		if len(errJSON) > mediumBlobSize {
-			return nil, fmt.Errorf("Error object is too large to store in the database")
-		}
-		om.Error = errJSON
-	}
-	return om, nil
-}
-
-func modelToOrderv2(om *orderModelv2) (*corepb.Order, error) {
 	order := &corepb.Order{
 		Id:                     om.ID,
 		RegistrationID:         om.RegistrationID,
@@ -480,7 +375,9 @@ func modelToOrderv2(om *orderModelv2) (*corepb.Order, error) {
 		Created:                timestamppb.New(om.Created),
 		CertificateSerial:      om.CertificateSerial,
 		BeganProcessing:        om.BeganProcessing,
-		CertificateProfileName: om.CertificateProfileName,
+		CertificateProfileName: profile,
+		Replaces:               replaces,
+		V2Authorizations:       v2Authorizations,
 	}
 	if len(om.Error) > 0 {
 		var problem corepb.ProblemDetails
@@ -497,23 +394,27 @@ func modelToOrderv2(om *orderModelv2) (*corepb.Order, error) {
 }
 
 var challTypeToUint = map[string]uint8{
-	"http-01":     0,
-	"dns-01":      1,
-	"tls-alpn-01": 2,
+	"http-01":        0,
+	"dns-01":         1,
+	"tls-alpn-01":    2,
+	"dns-account-01": 3,
 }
 
 var uintToChallType = map[uint8]string{
 	0: "http-01",
 	1: "dns-01",
 	2: "tls-alpn-01",
+	3: "dns-account-01",
 }
 
 var identifierTypeToUint = map[string]uint8{
 	"dns": 0,
+	"ip":  1,
 }
 
-var uintToIdentifierType = map[uint8]string{
+var uintToIdentifierType = map[uint8]identifier.IdentifierType{
 	0: "dns",
+	1: "ip",
 }
 
 var statusToUint = map[core.AcmeStatus]uint8{
@@ -538,21 +439,24 @@ func statusUint(status core.AcmeStatus) uint8 {
 
 // authzFields is used in a variety of places in sa.go, and modifications to
 // it must be carried through to every use in sa.go
-const authzFields = "id, identifierType, identifierValue, registrationID, status, expires, challenges, attempted, attemptedAt, token, validationError, validationRecord"
+const authzFields = "id, identifierType, identifierValue, registrationID, certificateProfileName, status, expires, challenges, attempted, attemptedAt, token, validationError, validationRecord"
 
+// authzModel represents one row in the authz2 table. The CertificateProfileName
+// column is a pointer because the column is NULL-able.
 type authzModel struct {
-	ID               int64      `db:"id"`
-	IdentifierType   uint8      `db:"identifierType"`
-	IdentifierValue  string     `db:"identifierValue"`
-	RegistrationID   int64      `db:"registrationID"`
-	Status           uint8      `db:"status"`
-	Expires          time.Time  `db:"expires"`
-	Challenges       uint8      `db:"challenges"`
-	Attempted        *uint8     `db:"attempted"`
-	AttemptedAt      *time.Time `db:"attemptedAt"`
-	Token            []byte     `db:"token"`
-	ValidationError  []byte     `db:"validationError"`
-	ValidationRecord []byte     `db:"validationRecord"`
+	ID                     int64      `db:"id"`
+	IdentifierType         uint8      `db:"identifierType"`
+	IdentifierValue        string     `db:"identifierValue"`
+	RegistrationID         int64      `db:"registrationID"`
+	CertificateProfileName *string    `db:"certificateProfileName"`
+	Status                 uint8      `db:"status"`
+	Expires                time.Time  `db:"expires"`
+	Challenges             uint8      `db:"challenges"`
+	Attempted              *uint8     `db:"attempted"`
+	AttemptedAt            *time.Time `db:"attemptedAt"`
+	Token                  []byte     `db:"token"`
+	ValidationError        []byte     `db:"validationError"`
+	ValidationRecord       []byte     `db:"validationRecord"`
 }
 
 // rehydrateHostPort mutates a validation record. If the URL in the validation
@@ -624,29 +528,28 @@ func SelectAuthzsMatchingIssuance(
 	s db.Selector,
 	regID int64,
 	issued time.Time,
-	dnsNames []string,
+	idents identifier.ACMEIdentifiers,
 ) ([]*corepb.Authorization, error) {
+	// The WHERE clause returned by this function does not contain any
+	// user-controlled strings; all user-controlled input ends up in the
+	// returned placeholder args.
+	identConditions, identArgs := buildIdentifierQueryConditions(idents)
 	query := fmt.Sprintf(`SELECT %s FROM authz2 WHERE
 			registrationID = ? AND
 			status IN (?, ?) AND
 			expires >= ? AND
 			attemptedAt <= ? AND
-			identifierType = ? AND
-			identifierValue IN (%s)`,
+			(%s)`,
 		authzFields,
-		db.QuestionMarks(len(dnsNames)))
+		identConditions)
 	var args []any
 	args = append(args,
 		regID,
-		statusToUint[core.StatusValid],
-		statusToUint[core.StatusDeactivated],
+		statusToUint[core.StatusValid], statusToUint[core.StatusDeactivated],
 		issued.Add(-1*time.Second), // leeway for clock skew
 		issued.Add(1*time.Second),  // leeway for clock skew
-		identifierTypeToUint[string(identifier.DNS)],
 	)
-	for _, name := range dnsNames {
-		args = append(args, name)
-	}
+	args = append(args, identArgs...)
 
 	var authzModels []authzModel
 	_, err := s.Select(ctx, &authzModels, query, args...)
@@ -682,14 +585,53 @@ func hasMultipleNonPendingChallenges(challenges []*corepb.Challenge) bool {
 	return false
 }
 
+// newAuthzReqToModel converts an sapb.NewAuthzRequest to the authzModel storage
+// representation. It hardcodes the status to "pending" because it should be
+// impossible to create an authz in any other state.
+func newAuthzReqToModel(authz *sapb.NewAuthzRequest, profile string) (*authzModel, error) {
+	am := &authzModel{
+		IdentifierType:  identifierTypeToUint[authz.Identifier.Type],
+		IdentifierValue: authz.Identifier.Value,
+		RegistrationID:  authz.RegistrationID,
+		Status:          statusToUint[core.StatusPending],
+		Expires:         authz.Expires.AsTime(),
+	}
+
+	if profile != "" {
+		am.CertificateProfileName = &profile
+	}
+
+	for _, challType := range authz.ChallengeTypes {
+		// Set the challenge type bit in the bitmap
+		am.Challenges |= 1 << challTypeToUint[challType]
+	}
+
+	token, err := base64.RawURLEncoding.DecodeString(authz.Token)
+	if err != nil {
+		return nil, err
+	}
+	am.Token = token
+
+	return am, nil
+}
+
 // authzPBToModel converts a protobuf authorization representation to the
 // authzModel storage representation.
+// Deprecated: this function is only used as part of test setup, do not
+// introduce any new uses in production code.
 func authzPBToModel(authz *corepb.Authorization) (*authzModel, error) {
+	ident := identifier.FromProto(authz.Identifier)
+
 	am := &authzModel{
-		IdentifierValue: authz.Identifier,
+		IdentifierType:  identifierTypeToUint[ident.ToProto().Type],
+		IdentifierValue: ident.Value,
 		RegistrationID:  authz.RegistrationID,
 		Status:          statusToUint[core.AcmeStatus(authz.Status)],
 		Expires:         authz.Expires.AsTime(),
+	}
+	if authz.CertificateProfileName != "" {
+		profile := authz.CertificateProfileName
+		am.CertificateProfileName = &profile
 	}
 	if authz.Id != "" {
 		// The v1 internal authorization objects use a string for the ID, the v2
@@ -791,10 +733,7 @@ func populateAttemptedFields(am authzModel, challenge *corepb.Challenge) error {
 				am.ValidationError,
 				err)
 		}
-		challenge.Error, err = grpc.ProblemDetailsToPB(&prob)
-		if err != nil {
-			return err
-		}
+		challenge.Error = grpc.ProblemDetailsToPB(&prob)
 	} else {
 		// If the error is empty the challenge must be valid.
 		challenge.Status = string(core.StatusValid)
@@ -811,7 +750,6 @@ func populateAttemptedFields(am authzModel, challenge *corepb.Challenge) error {
 	for i, r := range records {
 		// Fixes implicit memory aliasing in for loop so we can deference r
 		// later on for rehydrateHostPort.
-		r := r
 		if challenge.Type == string(core.ChallengeTypeHTTP01) {
 			err := rehydrateHostPort(&r)
 			if err != nil {
@@ -827,12 +765,23 @@ func populateAttemptedFields(am authzModel, challenge *corepb.Challenge) error {
 }
 
 func modelToAuthzPB(am authzModel) (*corepb.Authorization, error) {
+	identType, ok := uintToIdentifierType[am.IdentifierType]
+	if !ok {
+		return nil, fmt.Errorf("unrecognized identifier type encoding %d", am.IdentifierType)
+	}
+
+	profile := ""
+	if am.CertificateProfileName != nil {
+		profile = *am.CertificateProfileName
+	}
+
 	pb := &corepb.Authorization{
-		Id:             fmt.Sprintf("%d", am.ID),
-		Status:         string(uintToStatus[am.Status]),
-		Identifier:     am.IdentifierValue,
-		RegistrationID: am.RegistrationID,
-		Expires:        timestamppb.New(am.Expires),
+		Id:                     fmt.Sprintf("%d", am.ID),
+		Status:                 string(uintToStatus[am.Status]),
+		Identifier:             identifier.ACMEIdentifier{Type: identType, Value: am.IdentifierValue}.ToProto(),
+		RegistrationID:         am.RegistrationID,
+		Expires:                timestamppb.New(am.Expires),
+		CertificateProfileName: profile,
 	}
 	// Populate authorization challenge array. We do this by iterating through
 	// the challenge type bitmap and creating a challenge of each type if its
@@ -842,7 +791,7 @@ func modelToAuthzPB(am authzModel) (*corepb.Authorization, error) {
 	// to core.StatusValid or core.StatusInvalid depending on if there is anything
 	// in ValidationError and populate the ValidationRecord and ValidationError
 	// fields.
-	for pos := uint8(0); pos < 8; pos++ {
+	for pos := range uint8(8) {
 		if (am.Challenges>>pos)&1 == 1 {
 			challType := uintToChallType[pos]
 			challenge := &corepb.Challenge{
@@ -926,6 +875,16 @@ type crlEntryModel struct {
 	RevokedDate   time.Time         `db:"revokedDate"`
 }
 
+// fqdnSet contains the SHA256 hash of the lowercased, comma joined dNSNames
+// contained in a certificate.
+type fqdnSet struct {
+	ID      int64
+	SetHash []byte
+	Serial  string
+	Issued  time.Time
+	Expires time.Time
+}
+
 // orderFQDNSet contains the SHA256 hash of the lowercased, comma joined names
 // from a new-order request, along with the corresponding orderID, the
 // registration ID, and the order expiry. This is used to find
@@ -938,9 +897,9 @@ type orderFQDNSet struct {
 	Expires        time.Time
 }
 
-func addFQDNSet(ctx context.Context, db db.Inserter, names []string, serial string, issued time.Time, expires time.Time) error {
-	return db.Insert(ctx, &core.FQDNSet{
-		SetHash: core.HashNames(names),
+func addFQDNSet(ctx context.Context, db db.Inserter, idents identifier.ACMEIdentifiers, serial string, issued time.Time, expires time.Time) error {
+	return db.Insert(ctx, &fqdnSet{
+		SetHash: core.HashIdentifiers(idents),
 		Serial:  serial,
 		Issued:  issued,
 		Expires: expires,
@@ -954,12 +913,12 @@ func addFQDNSet(ctx context.Context, db db.Inserter, names []string, serial stri
 func addOrderFQDNSet(
 	ctx context.Context,
 	db db.Inserter,
-	names []string,
+	idents identifier.ACMEIdentifiers,
 	orderID int64,
 	regID int64,
 	expires time.Time) error {
 	return db.Insert(ctx, &orderFQDNSet{
-		SetHash:        core.HashNames(names),
+		SetHash:        core.HashIdentifiers(idents),
 		OrderID:        orderID,
 		RegistrationID: regID,
 		Expires:        expires,
@@ -995,28 +954,64 @@ func deleteOrderFQDNSet(
 	return nil
 }
 
-func addIssuedNames(ctx context.Context, queryer db.Queryer, cert *x509.Certificate, isRenewal bool) error {
-	if len(cert.DNSNames) == 0 {
-		return berrors.InternalServerError("certificate has no DNSNames")
+func addIssuedNames(ctx context.Context, queryer db.Execer, cert *x509.Certificate, isRenewal bool) error {
+	if len(cert.DNSNames) == 0 && len(cert.IPAddresses) == 0 {
+		return berrors.InternalServerError("certificate has no DNSNames or IPAddresses")
 	}
 
-	multiInserter, err := db.NewMultiInserter("issuedNames", []string{"reversedName", "serial", "notBefore", "renewal"}, "")
+	multiInserter, err := db.NewMultiInserter("issuedNames", []string{"reversedName", "serial", "notBefore", "renewal"})
 	if err != nil {
 		return err
 	}
 	for _, name := range cert.DNSNames {
-		err = multiInserter.Add([]interface{}{
-			ReverseName(name),
+		err = multiInserter.Add([]any{
+			reverseFQDN(name),
 			core.SerialToString(cert.SerialNumber),
-			cert.NotBefore,
+			cert.NotBefore.Truncate(24 * time.Hour),
 			isRenewal,
 		})
 		if err != nil {
 			return err
 		}
 	}
-	_, err = multiInserter.Insert(ctx, queryer)
-	return err
+	for _, ip := range cert.IPAddresses {
+		err = multiInserter.Add([]any{
+			ip.String(),
+			core.SerialToString(cert.SerialNumber),
+			cert.NotBefore.Truncate(24 * time.Hour),
+			isRenewal,
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return multiInserter.Insert(ctx, queryer)
+}
+
+// EncodeIssuedName translates a FQDN to/from the issuedNames table by reversing
+// its dot-separated elements, and translates an IP address by returning its
+// normal string form.
+//
+// This is for strings of ambiguous identifier values. If you know your string
+// is a FQDN, use reverseFQDN(). If you have an IP address, use
+// netip.Addr.String() or net.IP.String().
+func EncodeIssuedName(name string) string {
+	netIP, err := netip.ParseAddr(name)
+	if err == nil {
+		return netIP.String()
+	}
+	return reverseFQDN(name)
+}
+
+// reverseFQDN reverses the elements of a dot-separated FQDN.
+//
+// If your string might be an IP address, use EncodeIssuedName() instead.
+func reverseFQDN(fqdn string) string {
+	labels := strings.Split(fqdn, ".")
+	for i, j := 0, len(labels)-1; i < j; i, j = i+1, j-1 {
+		labels[i], labels[j] = labels[j], labels[i]
+	}
+	return strings.Join(labels, ".")
 }
 
 func addKeyHash(ctx context.Context, db db.Inserter, cert *x509.Certificate) error {
@@ -1115,8 +1110,8 @@ func statusForOrder(order *corepb.Order, authzValidityInfo []authzValidity, now 
 	}
 
 	// An order is fully authorized if it has valid authzs for each of the order
-	// names
-	fullyAuthorized := len(order.Names) == validAuthzs
+	// identifiers
+	fullyAuthorized := len(order.Identifiers) == validAuthzs
 
 	// If the order isn't fully authorized we've encountered an internal error:
 	// Above we checked for any invalid or pending authzs and should have returned
@@ -1160,7 +1155,7 @@ type authzValidity struct {
 // getAuthorizationStatuses takes a sequence of authz IDs, and returns the
 // status and expiration date of each of them.
 func getAuthorizationStatuses(ctx context.Context, s db.Selector, ids []int64) ([]authzValidity, error) {
-	var params []interface{}
+	var params []any
 	for _, id := range ids {
 		params = append(params, id)
 	}
@@ -1177,18 +1172,6 @@ func getAuthorizationStatuses(ctx context.Context, s db.Selector, ids []int64) (
 	}
 
 	return validities, nil
-}
-
-// authzForOrder retrieves the authorization IDs for an order.
-func authzForOrder(ctx context.Context, s db.Selector, orderID int64) ([]int64, error) {
-	var v2IDs []int64
-	_, err := s.Select(
-		ctx,
-		&v2IDs,
-		"SELECT authzID FROM orderToAuthz2 WHERE orderID = ?",
-		orderID,
-	)
-	return v2IDs, err
 }
 
 // crlShardModel represents one row in the crlShards table. The ThisUpdate and
@@ -1293,4 +1276,141 @@ func setReplacementOrderFinalized(ctx context.Context, db db.Execer, orderID int
 		return err
 	}
 	return nil
+}
+
+type identifierModel struct {
+	Type  uint8  `db:"identifierType"`
+	Value string `db:"identifierValue"`
+}
+
+func newIdentifierModelFromPB(pb *corepb.Identifier) (identifierModel, error) {
+	idType, ok := identifierTypeToUint[pb.Type]
+	if !ok {
+		return identifierModel{}, fmt.Errorf("unsupported identifier type %q", pb.Type)
+	}
+
+	return identifierModel{
+		Type:  idType,
+		Value: pb.Value,
+	}, nil
+}
+
+func newPBFromIdentifierModel(id identifierModel) (*corepb.Identifier, error) {
+	idType, ok := uintToIdentifierType[id.Type]
+	if !ok {
+		return nil, fmt.Errorf("unsupported identifier type %d", id.Type)
+	}
+
+	return &corepb.Identifier{
+		Type:  string(idType),
+		Value: id.Value,
+	}, nil
+}
+
+func newIdentifierModelsFromPB(pbs []*corepb.Identifier) ([]identifierModel, error) {
+	ids := make([]identifierModel, 0, len(pbs))
+	for _, pb := range pbs {
+		id, err := newIdentifierModelFromPB(pb)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func newPBFromIdentifierModels(ids []identifierModel) (*sapb.Identifiers, error) {
+	pbs := make([]*corepb.Identifier, 0, len(ids))
+	for _, id := range ids {
+		pb, err := newPBFromIdentifierModel(id)
+		if err != nil {
+			return nil, err
+		}
+		pbs = append(pbs, pb)
+	}
+	return &sapb.Identifiers{Identifiers: pbs}, nil
+}
+
+// buildIdentifierQueryConditions takes a slice of identifiers and returns a
+// string (conditions to use within the prepared statement) and a slice of anys
+// (arguments for the prepared statement), both to use within a WHERE clause for
+// queries against the authz2 table.
+//
+// Although this function takes user-controlled input, it does not include any
+// of that input directly in the returned SQL string. The resulting string
+// contains only column names, boolean operators, and questionmark placeholders.
+func buildIdentifierQueryConditions(idents identifier.ACMEIdentifiers) (string, []any) {
+	if len(idents) == 0 {
+		// No identifier values to check.
+		return "FALSE", []any{}
+	}
+
+	identsByType := map[identifier.IdentifierType][]string{}
+	for _, id := range idents {
+		identsByType[id.Type] = append(identsByType[id.Type], id.Value)
+	}
+
+	var conditions []string
+	var args []any
+	for idType, idValues := range identsByType {
+		conditions = append(conditions,
+			fmt.Sprintf("identifierType = ? AND identifierValue IN (%s)",
+				db.QuestionMarks(len(idValues)),
+			),
+		)
+		args = append(args, identifierTypeToUint[string(idType)])
+		for _, idValue := range idValues {
+			args = append(args, idValue)
+		}
+	}
+
+	return strings.Join(conditions, " OR "), args
+}
+
+// pausedModel represents a row in the paused table. It contains the
+// registrationID of the paused account, the time the (account, identifier) pair
+// was paused, and the time the pair was unpaused. The UnpausedAt field is
+// nullable because the pair may not have been unpaused yet. A pair is
+// considered paused if there is a matching row in the paused table with a NULL
+// UnpausedAt time.
+type pausedModel struct {
+	identifierModel
+	RegistrationID int64      `db:"registrationID"`
+	PausedAt       time.Time  `db:"pausedAt"`
+	UnpausedAt     *time.Time `db:"unpausedAt"`
+}
+
+type overrideModel struct {
+	LimitEnum int64     `db:"limitEnum"`
+	BucketKey string    `db:"bucketKey"`
+	Comment   string    `db:"comment"`
+	PeriodNS  int64     `db:"periodNS"`
+	Count     int64     `db:"count"`
+	Burst     int64     `db:"burst"`
+	UpdatedAt time.Time `db:"updatedAt"`
+	Enabled   bool      `db:"enabled"`
+}
+
+func overrideModelForPB(pb *sapb.RateLimitOverride, updatedAt time.Time, enabled bool) overrideModel {
+	return overrideModel{
+		LimitEnum: pb.LimitEnum,
+		BucketKey: pb.BucketKey,
+		Comment:   pb.Comment,
+		PeriodNS:  pb.Period.AsDuration().Nanoseconds(),
+		Count:     pb.Count,
+		Burst:     pb.Burst,
+		UpdatedAt: updatedAt,
+		Enabled:   enabled,
+	}
+}
+
+func newPBFromOverrideModel(m *overrideModel) *sapb.RateLimitOverride {
+	return &sapb.RateLimitOverride{
+		LimitEnum: m.LimitEnum,
+		BucketKey: m.BucketKey,
+		Comment:   m.Comment,
+		Period:    durationpb.New(time.Duration(m.PeriodNS)),
+		Count:     m.Count,
+		Burst:     m.Burst,
+	}
 }

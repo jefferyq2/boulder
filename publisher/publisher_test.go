@@ -33,10 +33,6 @@ import (
 	"github.com/letsencrypt/boulder/test"
 )
 
-func TestImplementation(t *testing.T) {
-	test.AssertImplementsGRPCServer(t, &Impl{}, pubpb.UnimplementedPublisherServer{})
-}
-
 var log = blog.UseMock()
 var ctx = context.Background()
 
@@ -71,10 +67,7 @@ func logSrv(k *ecdsa.PrivateKey) *testLogSrv {
 		if err != nil {
 			return
 		}
-		precert := false
-		if r.URL.Path == "/ct/v1/add-pre-chain" {
-			precert = true
-		}
+		precert := r.URL.Path == "/ct/v1/add-pre-chain"
 		sct := CreateTestingSignedSCT(jsonReq.Chain, k, precert, time.Now())
 		fmt.Fprint(w, string(sct))
 		atomic.AddInt64(&testLog.submissions, 1)
@@ -96,10 +89,7 @@ func lyingLogSrv(k *ecdsa.PrivateKey, timestamp time.Time) *testLogSrv {
 		if err != nil {
 			return
 		}
-		precert := false
-		if r.URL.Path == "/ct/v1/add-pre-chain" {
-			precert = true
-		}
+		precert := r.URL.Path == "/ct/v1/add-pre-chain"
 		sct := CreateTestingSignedSCT(jsonReq.Chain, k, precert, timestamp)
 		fmt.Fprint(w, string(sct))
 		atomic.AddInt64(&testLog.submissions, 1)
@@ -273,7 +263,7 @@ func TestTimestampVerificationPast(t *testing.T) {
 
 func TestLogCache(t *testing.T) {
 	cache := logCache{
-		logs: make(map[string]*Log),
+		logs: make(map[cacheKey]*Log),
 	}
 
 	// Adding a log with an invalid base64 public key should error

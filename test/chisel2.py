@@ -39,7 +39,7 @@ DIRECTORY_V2 = os.getenv('DIRECTORY_V2', 'http://boulder.service.consul:4001/dir
 ACCEPTABLE_TOS = os.getenv('ACCEPTABLE_TOS',"https://boulder.service.consul:4431/terms/v7")
 PORT = os.getenv('PORT', '80')
 
-os.environ.setdefault('REQUESTS_CA_BUNDLE', 'test/wfe-tls/minica.pem')
+os.environ.setdefault('REQUESTS_CA_BUNDLE', 'test/certs/ipki/minica.pem')
 
 import challtestsrv
 challSrv = challtestsrv.ChallTestServer()
@@ -96,6 +96,19 @@ def get_chall(authz, typ):
             return chall_body
     raise Exception("No %s challenge found" % typ.typ)
 
+def get_any_supported_chall(authz):
+    """
+    Return the first supported challenge from the given authorization.
+    Supports HTTP01 and DNS01.
+
+    Note: DNS-ACCOUNT-01 challenge type is excluded from the list of supported
+    challenge types until the Python ACME library adds support for it.
+    """
+    for chall_body in authz.body.challenges:
+        if isinstance(chall_body.chall, (challenges.HTTP01, challenges.DNS01)):
+            return chall_body
+    raise Exception("No supported challenge types found in authorization")
+
 def make_csr(domains):
     key = OpenSSL.crypto.PKey()
     key.generate_key(OpenSSL.crypto.TYPE_RSA, 2048)
@@ -124,18 +137,24 @@ def auth_and_issue(domains, chall_type="dns-01", email=None, cert_output=None, c
         cleanup = do_http_challenges(client, authzs)
     elif chall_type == "dns-01":
         cleanup = do_dns_challenges(client, authzs)
-    elif chall_type == "tls-alpn-01":
-        cleanup = do_tlsalpn_challenges(client, authzs)
     else:
         raise Exception("invalid challenge type %s" % chall_type)
 
-    try:
-        order = client.poll_and_finalize(order)
-        if cert_output is not None:
-            with open(cert_output, "w") as f:
-                f.write(order.fullchain_pem)
-    finally:
-        cleanup()
+    # Make up to three attempts, retrying on badNonce errors
+    for n in range(3):
+        time.sleep(0.2 * n)  # No sleep before the first attempt, then backoff
+        try:
+            order = client.poll_and_finalize(order)
+            if cert_output is not None:
+                with open(cert_output, "w") as f:
+                    f.write(order.fullchain_pem)
+        except messages.Error as e:
+            if e.typ == "urn:ietf:params:acme:error:badNonce":
+                continue
+        else:
+            break
+        finally:
+            cleanup()
 
     return order
 
@@ -176,19 +195,6 @@ def do_http_challenges(client, authzs):
         # the tokens we added.
         for token in cleanup_tokens:
             challSrv.remove_http01_response(token)
-    return cleanup
-
-def do_tlsalpn_challenges(client, authzs):
-    cleanup_hosts = []
-    for a in authzs:
-        c = get_chall(a, challenges.TLSALPN01)
-        name, value = (a.body.identifier.value, c.key_authorization(client.net.key))
-        cleanup_hosts.append(name)
-        challSrv.add_tlsalpn01_response(name, value)
-        client.answer_challenge(c, c.response(client.net.key))
-    def cleanup():
-        for host in cleanup_hosts:
-            challSrv.remove_tlsalpn01_response(host)
     return cleanup
 
 def expect_problem(problem_type, func):

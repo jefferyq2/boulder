@@ -18,7 +18,6 @@ import (
 	"slices"
 	"time"
 
-	"golang.org/x/crypto/ocsp"
 	"gopkg.in/yaml.v3"
 
 	zlintx509 "github.com/zmap/zcrypto/x509"
@@ -27,6 +26,7 @@ import (
 	"github.com/letsencrypt/boulder/goodkey"
 	"github.com/letsencrypt/boulder/linter"
 	"github.com/letsencrypt/boulder/pkcs11helpers"
+	"github.com/letsencrypt/boulder/revocation"
 	"github.com/letsencrypt/boulder/strictyaml"
 )
 
@@ -34,7 +34,7 @@ var kp goodkey.KeyPolicy
 
 func init() {
 	var err error
-	kp, err = goodkey.NewKeyPolicy(&goodkey.Config{FermatRounds: 100}, nil)
+	kp, err = goodkey.NewPolicy(nil, nil)
 	if err != nil {
 		log.Fatal("Could not create goodkey.KeyPolicy")
 	}
@@ -96,12 +96,11 @@ func postIssuanceLinting(fc *x509.Certificate, skipLints []string) error {
 
 type keyGenConfig struct {
 	Type         string `yaml:"type"`
-	RSAModLength uint   `yaml:"rsa-mod-length"`
+	RSAModLength int    `yaml:"rsa-mod-length"`
 	ECDSACurve   string `yaml:"ecdsa-curve"`
 }
 
 var allowedCurves = map[string]bool{
-	"P-224": true,
 	"P-256": true,
 	"P-384": true,
 	"P-521": true,
@@ -121,7 +120,7 @@ func (kgc keyGenConfig) validate() error {
 		return errors.New("if key.type = 'rsa' then key.ecdsa-curve is not used")
 	}
 	if kgc.Type == "ecdsa" && !allowedCurves[kgc.ECDSACurve] {
-		return errors.New("key.ecdsa-curve can only be 'P-224', 'P-256', 'P-384', or 'P-521'")
+		return errors.New("key.ecdsa-curve can only be 'P-256', 'P-384', or 'P-521'")
 	}
 	if kgc.Type == "ecdsa" && kgc.RSAModLength != 0 {
 		return errors.New("if key.type = 'ecdsa' then key.rsa-mod-length is not used")
@@ -239,7 +238,7 @@ type intermediateConfig struct {
 	SkipLints   []string    `yaml:"skip-lints"`
 }
 
-func (ic intermediateConfig) validate(ct certType) error {
+func (ic intermediateConfig) validate() error {
 	err := ic.PKCS11.validate()
 	if err != nil {
 		return err
@@ -260,7 +259,7 @@ func (ic intermediateConfig) validate(ct certType) error {
 	}
 
 	// Certificate profile
-	err = ic.CertProfile.verifyProfile(ct)
+	err = ic.CertProfile.verifyProfile(intermediateCert)
 	if err != nil {
 		return err
 	}
@@ -378,59 +377,6 @@ func (kc keyConfig) validate() error {
 	return nil
 }
 
-type ocspRespConfig struct {
-	CeremonyType string              `yaml:"ceremony-type"`
-	PKCS11       PKCS11SigningConfig `yaml:"pkcs11"`
-	Inputs       struct {
-		CertificatePath                string `yaml:"certificate-path"`
-		IssuerCertificatePath          string `yaml:"issuer-certificate-path"`
-		DelegatedIssuerCertificatePath string `yaml:"delegated-issuer-certificate-path"`
-	} `yaml:"inputs"`
-	Outputs struct {
-		ResponsePath string `yaml:"response-path"`
-	} `yaml:"outputs"`
-	OCSPProfile struct {
-		ThisUpdate string `yaml:"this-update"`
-		NextUpdate string `yaml:"next-update"`
-		Status     string `yaml:"status"`
-	} `yaml:"ocsp-profile"`
-}
-
-func (orc ocspRespConfig) validate() error {
-	err := orc.PKCS11.validate()
-	if err != nil {
-		return err
-	}
-
-	// Input fields
-	if orc.Inputs.CertificatePath == "" {
-		return errors.New("inputs.certificate-path is required")
-	}
-	if orc.Inputs.IssuerCertificatePath == "" {
-		return errors.New("inputs.issuer-certificate-path is required")
-	}
-	// DelegatedIssuerCertificatePath may be omitted
-
-	// Output fields
-	err = checkOutputFile(orc.Outputs.ResponsePath, "response-path")
-	if err != nil {
-		return err
-	}
-
-	// OCSP fields
-	if orc.OCSPProfile.ThisUpdate == "" {
-		return errors.New("ocsp-profile.this-update is required")
-	}
-	if orc.OCSPProfile.NextUpdate == "" {
-		return errors.New("ocsp-profile.next-update is required")
-	}
-	if orc.OCSPProfile.Status != "good" && orc.OCSPProfile.Status != "revoked" {
-		return errors.New("ocsp-profile.status must be either \"good\" or \"revoked\"")
-	}
-
-	return nil
-}
-
 type crlConfig struct {
 	CeremonyType string              `yaml:"ceremony-type"`
 	PKCS11       PKCS11SigningConfig `yaml:"pkcs11"`
@@ -447,9 +393,10 @@ type crlConfig struct {
 		RevokedCertificates []struct {
 			CertificatePath  string `yaml:"certificate-path"`
 			RevocationDate   string `yaml:"revocation-date"`
-			RevocationReason int    `yaml:"revocation-reason"`
+			RevocationReason string `yaml:"revocation-reason"`
 		} `yaml:"revoked-certificates"`
 	} `yaml:"crl-profile"`
+	SkipLints []string `yaml:"skip-lints"`
 }
 
 func (cc crlConfig) validate() error {
@@ -486,7 +433,7 @@ func (cc crlConfig) validate() error {
 		if rc.RevocationDate == "" {
 			return errors.New("crl-profile.revoked-certificates.revocation-date is required")
 		}
-		if rc.RevocationReason == 0 {
+		if rc.RevocationReason == "" {
 			return errors.New("crl-profile.revoked-certificates.revocation-reason is required")
 		}
 	}
@@ -504,7 +451,7 @@ func loadCert(filename string) (*x509.Certificate, error) {
 	log.Printf("Loaded certificate from %s\n", filename)
 	block, _ := pem.Decode(certPEM)
 	if block == nil {
-		return nil, fmt.Errorf("No data in cert PEM file %s", filename)
+		return nil, fmt.Errorf("no data in cert PEM file %q", filename)
 	}
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
@@ -599,7 +546,7 @@ func loadPubKey(filename string) (crypto.PublicKey, []byte, error) {
 	log.Printf("Loaded public key from %s\n", filename)
 	block, _ := pem.Decode(keyPEM)
 	if block == nil {
-		return nil, nil, fmt.Errorf("No data in cert PEM file %s", filename)
+		return nil, nil, fmt.Errorf("no data in cert PEM file %q", filename)
 	}
 	key, err := x509.ParsePKIXPublicKey(block.Bytes)
 	if err != nil {
@@ -645,10 +592,6 @@ func rootCeremony(configBytes []byte) error {
 	if err != nil {
 		return err
 	}
-	// Verify that the lintCert is self-signed.
-	if !bytes.Equal(lintCert.RawSubject, lintCert.RawIssuer) {
-		return fmt.Errorf("mismatch between self-signed lintCert RawSubject and RawIssuer DER bytes: \"%x\" != \"%x\"", lintCert.RawSubject, lintCert.RawIssuer)
-	}
 	finalCert, err := signAndWriteCert(template, template, lintCert, keyInfo.key, signer, config.Outputs.CertificatePath)
 	if err != nil {
 		return err
@@ -662,17 +605,14 @@ func rootCeremony(configBytes []byte) error {
 	return nil
 }
 
-func intermediateCeremony(configBytes []byte, ct certType) error {
-	if ct != intermediateCert && ct != ocspCert && ct != crlCert {
-		return fmt.Errorf("wrong certificate type provided")
-	}
+func intermediateCeremony(configBytes []byte) error {
 	var config intermediateConfig
 	err := strictyaml.Unmarshal(configBytes, &config)
 	if err != nil {
 		return fmt.Errorf("failed to parse config: %s", err)
 	}
 	log.Printf("Preparing intermediate ceremony for %s\n", config.Outputs.CertificatePath)
-	err = config.validate(ct)
+	err = config.validate()
 	if err != nil {
 		return fmt.Errorf("failed to validate config: %s", err)
 	}
@@ -688,7 +628,7 @@ func intermediateCeremony(configBytes []byte, ct certType) error {
 	if err != nil {
 		return err
 	}
-	template, err := makeTemplate(randReader, &config.CertProfile, pubBytes, nil, ct)
+	template, err := makeTemplate(randReader, &config.CertProfile, pubBytes, nil, intermediateCert)
 	if err != nil {
 		return fmt.Errorf("failed to create certificate profile: %s", err)
 	}
@@ -696,10 +636,6 @@ func intermediateCeremony(configBytes []byte, ct certType) error {
 	lintCert, err := issueLintCertAndPerformLinting(template, issuer, pub, signer, config.SkipLints)
 	if err != nil {
 		return err
-	}
-	// Verify that the lintCert (and therefore the eventual finalCert) corresponds to the specified issuer certificate.
-	if !bytes.Equal(issuer.RawSubject, lintCert.RawIssuer) {
-		return fmt.Errorf("mismatch between issuer RawSubject and lintCert RawIssuer DER bytes: \"%x\" != \"%x\"", issuer.RawSubject, lintCert.RawIssuer)
 	}
 	finalCert, err := signAndWriteCert(template, issuer, lintCert, pub, signer, config.Outputs.CertificatePath)
 	if err != nil {
@@ -721,10 +657,7 @@ func intermediateCeremony(configBytes []byte, ct certType) error {
 	return nil
 }
 
-func crossCertCeremony(configBytes []byte, ct certType) error {
-	if ct != crossCert {
-		return fmt.Errorf("wrong certificate type provided")
-	}
+func crossCertCeremony(configBytes []byte) error {
 	var config crossCertConfig
 	err := strictyaml.Unmarshal(configBytes, &config)
 	if err != nil {
@@ -751,7 +684,7 @@ func crossCertCeremony(configBytes []byte, ct certType) error {
 	if err != nil {
 		return err
 	}
-	template, err := makeTemplate(randReader, &config.CertProfile, pubBytes, toBeCrossSigned, ct)
+	template, err := makeTemplate(randReader, &config.CertProfile, pubBytes, toBeCrossSigned, crossCert)
 	if err != nil {
 		return fmt.Errorf("failed to create certificate profile: %s", err)
 	}
@@ -780,16 +713,25 @@ func crossCertCeremony(configBytes []byte, ct certType) error {
 	if lintCert.NotBefore.Before(toBeCrossSigned.NotBefore) {
 		return fmt.Errorf("cross-signed subordinate CA's NotBefore predates the existing CA's NotBefore")
 	}
-	if !bytes.Equal(issuer.RawSubject, lintCert.RawIssuer) {
-		return fmt.Errorf("mismatch between issuer RawSubject and lintCert RawIssuer DER bytes: \"%x\" != \"%x\"", issuer.RawSubject, lintCert.RawIssuer)
-	}
 	// BR 7.1.2.2.3 Cross-Certified Subordinate CA Extensions
+	// We want the Extended Key Usages of our cross-signs to be identical to those
+	// in the cert being cross-signed, for the sake of consistency. However, our
+	// Root CA Certificates do not contain any EKUs, as required by BR 7.1.2.1.2.
+	// Therefore, cross-signs of our roots count as "unrestricted" cross-signs per
+	// the definition in BR 7.1.2.2.3, and are subject to the requirement that
+	// the cross-sign's Issuer and Subject fields must either:
+	// - have identical organizationNames; or
+	// - have orgnaizationNames which are affiliates of each other.
+	// Therefore, we enforce that cross-signs with empty EKUs have identical
+	// Subject Organization Name fields... or allow one special case where the
+	// issuer is "Internet Security Research Group" and the subject is "ISRG" to
+	// allow us to migrate from the longer string to the shorter one.
 	if !slices.Equal(lintCert.ExtKeyUsage, toBeCrossSigned.ExtKeyUsage) {
 		return fmt.Errorf("lint cert and toBeCrossSigned cert EKUs differ")
 	}
 	if len(lintCert.ExtKeyUsage) == 0 {
-		// "Unrestricted" case, the issuer and subject need to be the same or at least affiliates.
-		if !slices.Equal(lintCert.Subject.Organization, issuer.Subject.Organization) {
+		if !slices.Equal(lintCert.Subject.Organization, issuer.Subject.Organization) &&
+			!(slices.Equal(issuer.Subject.Organization, []string{"Internet Security Research Group"}) && slices.Equal(lintCert.Subject.Organization, []string{"ISRG"})) {
 			return fmt.Errorf("attempted unrestricted cross-sign of certificate operated by a different organization")
 		}
 	}
@@ -882,76 +824,6 @@ func keyCeremony(configBytes []byte) error {
 	return nil
 }
 
-func ocspRespCeremony(configBytes []byte) error {
-	var config ocspRespConfig
-	err := strictyaml.Unmarshal(configBytes, &config)
-	if err != nil {
-		return fmt.Errorf("failed to parse config: %s", err)
-	}
-	err = config.validate()
-	if err != nil {
-		return fmt.Errorf("failed to validate config: %s", err)
-	}
-
-	cert, err := loadCert(config.Inputs.CertificatePath)
-	if err != nil {
-		return fmt.Errorf("failed to load certificate %q: %s", config.Inputs.CertificatePath, err)
-	}
-	issuer, err := loadCert(config.Inputs.IssuerCertificatePath)
-	if err != nil {
-		return fmt.Errorf("failed to load issuer certificate %q: %s", config.Inputs.IssuerCertificatePath, err)
-	}
-	var signer crypto.Signer
-	var delegatedIssuer *x509.Certificate
-	if config.Inputs.DelegatedIssuerCertificatePath != "" {
-		delegatedIssuer, err = loadCert(config.Inputs.DelegatedIssuerCertificatePath)
-		if err != nil {
-			return fmt.Errorf("failed to load delegated issuer certificate %q: %s", config.Inputs.DelegatedIssuerCertificatePath, err)
-		}
-
-		signer, _, err = openSigner(config.PKCS11, delegatedIssuer.PublicKey)
-		if err != nil {
-			return err
-		}
-	} else {
-		signer, _, err = openSigner(config.PKCS11, issuer.PublicKey)
-		if err != nil {
-			return err
-		}
-	}
-
-	thisUpdate, err := time.Parse(time.DateTime, config.OCSPProfile.ThisUpdate)
-	if err != nil {
-		return fmt.Errorf("unable to parse ocsp-profile.this-update: %s", err)
-	}
-	nextUpdate, err := time.Parse(time.DateTime, config.OCSPProfile.NextUpdate)
-	if err != nil {
-		return fmt.Errorf("unable to parse ocsp-profile.next-update: %s", err)
-	}
-	var status int
-	switch config.OCSPProfile.Status {
-	case "good":
-		status = int(ocsp.Good)
-	case "revoked":
-		status = int(ocsp.Revoked)
-	default:
-		// this shouldn't happen if the config is validated
-		return fmt.Errorf("unexpected ocsp-profile.stats: %s", config.OCSPProfile.Status)
-	}
-
-	resp, err := generateOCSPResponse(signer, issuer, delegatedIssuer, cert, thisUpdate, nextUpdate, status)
-	if err != nil {
-		return err
-	}
-
-	err = writeFile(config.Outputs.ResponsePath, resp)
-	if err != nil {
-		return fmt.Errorf("failed to write OCSP response to %q: %s", config.Outputs.ResponsePath, err)
-	}
-
-	return nil
-}
-
 func crlCeremony(configBytes []byte) error {
 	var config crlConfig
 	err := strictyaml.Unmarshal(configBytes, &config)
@@ -998,9 +870,13 @@ func crlCeremony(configBytes []byte) error {
 			SerialNumber:   cert.SerialNumber,
 			RevocationTime: revokedAt,
 		}
-		encReason, err := asn1.Marshal(rc.RevocationReason)
+		reasonCode, err := revocation.StringToReason(rc.RevocationReason)
 		if err != nil {
-			return fmt.Errorf("failed to marshal revocation reason %q: %s", rc.RevocationReason, err)
+			return fmt.Errorf("looking up revocation reason: %w", err)
+		}
+		encReason, err := asn1.Marshal(reasonCode)
+		if err != nil {
+			return fmt.Errorf("failed to marshal revocation reason %d (%q): %s", reasonCode, rc.RevocationReason, err)
 		}
 		revokedCert.Extensions = []pkix.Extension{{
 			Id:    asn1.ObjectIdentifier{2, 5, 29, 21}, // id-ce-reasonCode
@@ -1009,7 +885,7 @@ func crlCeremony(configBytes []byte) error {
 		revokedCertificates = append(revokedCertificates, revokedCert)
 	}
 
-	crlBytes, err := generateCRL(signer, issuer, thisUpdate, nextUpdate, config.CRLProfile.Number, revokedCertificates)
+	crlBytes, err := generateCRL(signer, issuer, thisUpdate, nextUpdate, config.CRLProfile.Number, revokedCertificates, config.SkipLints)
 	if err != nil {
 		return err
 	}
@@ -1055,12 +931,12 @@ func main() {
 			log.Fatalf("root ceremony failed: %s", err)
 		}
 	case "cross-certificate":
-		err = crossCertCeremony(configBytes, crossCert)
+		err = crossCertCeremony(configBytes)
 		if err != nil {
 			log.Fatalf("cross-certificate ceremony failed: %s", err)
 		}
 	case "intermediate":
-		err = intermediateCeremony(configBytes, intermediateCert)
+		err = intermediateCeremony(configBytes)
 		if err != nil {
 			log.Fatalf("intermediate ceremony failed: %s", err)
 		}
@@ -1069,32 +945,17 @@ func main() {
 		if err != nil {
 			log.Fatalf("cross-csr ceremony failed: %s", err)
 		}
-	case "ocsp-signer":
-		err = intermediateCeremony(configBytes, ocspCert)
-		if err != nil {
-			log.Fatalf("ocsp signer ceremony failed: %s", err)
-		}
 	case "key":
 		err = keyCeremony(configBytes)
 		if err != nil {
 			log.Fatalf("key ceremony failed: %s", err)
-		}
-	case "ocsp-response":
-		err = ocspRespCeremony(configBytes)
-		if err != nil {
-			log.Fatalf("ocsp response ceremony failed: %s", err)
 		}
 	case "crl":
 		err = crlCeremony(configBytes)
 		if err != nil {
 			log.Fatalf("crl ceremony failed: %s", err)
 		}
-	case "crl-signer":
-		err = intermediateCeremony(configBytes, crlCert)
-		if err != nil {
-			log.Fatalf("crl signer ceremony failed: %s", err)
-		}
 	default:
-		log.Fatalf("unknown ceremony-type, must be one of: root, cross-certificate, intermediate, cross-csr, ocsp-signer, key, ocsp-response, crl, crl-signer")
+		log.Fatalf("unknown ceremony-type, must be one of: root, cross-certificate, intermediate, cross-csr, key, crl")
 	}
 }

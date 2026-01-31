@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/url"
 	"testing"
 
-	"github.com/letsencrypt/boulder/test"
 	"github.com/miekg/dns"
+
+	"github.com/letsencrypt/boulder/test"
 )
 
 func TestError(t *testing.T) {
@@ -16,9 +18,6 @@ func TestError(t *testing.T) {
 		expected string
 	}{
 		{
-			&Error{dns.TypeA, "hostname", makeTimeoutError(), -1, nil},
-			"DNS problem: query timed out looking up A for hostname",
-		}, {
 			&Error{dns.TypeMX, "hostname", &net.OpError{Err: errors.New("some net error")}, -1, nil},
 			"DNS problem: networking error looking up MX for hostname",
 		}, {
@@ -51,6 +50,9 @@ func TestError(t *testing.T) {
 		}, {
 			&Error{dns.TypeA, "hostname", nil, dns.RcodeFormatError, nil},
 			"DNS problem: FORMERR looking up A for hostname",
+		}, {
+			&Error{dns.TypeA, "hostname", &url.Error{Op: "GET", URL: "https://example.com/", Err: dohTimeoutError{}}, -1, nil},
+			"DNS problem: query timed out looking up A for hostname",
 		},
 	}
 	for _, tc := range testCases {
@@ -58,6 +60,16 @@ func TestError(t *testing.T) {
 			t.Errorf("got %q, expected %q", tc.err.Error(), tc.expected)
 		}
 	}
+}
+
+type dohTimeoutError struct{}
+
+func (dohTimeoutError) Error() string {
+	return "doh no"
+}
+
+func (dohTimeoutError) Timeout() bool {
+	return true
 }
 
 func TestWrapErr(t *testing.T) {

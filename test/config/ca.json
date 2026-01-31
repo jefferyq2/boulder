@@ -1,22 +1,16 @@
 {
 	"ca": {
-		"debugAddr": ":8001",
 		"tls": {
-			"caCertFile": "test/grpc-creds/minica.pem",
-			"certFile": "test/grpc-creds/ca.boulder/cert.pem",
-			"keyFile": "test/grpc-creds/ca.boulder/key.pem"
+			"caCertFile": "test/certs/ipki/minica.pem",
+			"certFile": "test/certs/ipki/ca.boulder/cert.pem",
+			"keyFile": "test/certs/ipki/ca.boulder/key.pem"
 		},
-		"hostnamePolicyFile": "test/hostname-policy.yaml",
+		"hostnamePolicyFile": "test/ident-policy.yaml",
 		"grpcCA": {
 			"maxConnectionAge": "30s",
 			"address": ":9093",
 			"services": {
 				"ca.CertificateAuthority": {
-					"clientNames": [
-						"ra.boulder"
-					]
-				},
-				"ca.OCSPGenerator": {
 					"clientNames": [
 						"ra.boulder"
 					]
@@ -33,6 +27,16 @@
 				}
 			}
 		},
+		"sctService": {
+			"dnsAuthority": "consul.service.consul",
+			"srvLookup": {
+				"service": "ra-sct-provider",
+				"domain": "service.consul"
+			},
+			"timeout": "15s",
+			"noWaitForReady": true,
+			"hostOverride": "ra.boulder"
+		},
 		"saService": {
 			"dnsAuthority": "consul.service.consul",
 			"srvLookup": {
@@ -44,76 +48,143 @@
 			"hostOverride": "sa.boulder"
 		},
 		"issuance": {
-			"profile": {
-				"allowMustStaple": true,
-				"allowCTPoison": true,
-				"allowSCTList": true,
-				"allowCommonName": true,
-				"policies": [
-					{
-						"oid": "2.23.140.1.2.1"
-					}
-				],
-				"maxValidityPeriod": "7776000s",
-				"maxValidityBackdate": "1h5m"
+			"certProfiles": {
+				"legacy": {
+					"omitCommonName": false,
+					"omitKeyEncipherment": false,
+					"omitClientAuth": false,
+					"omitSKID": false,
+					"maxValidityPeriod": "7776000s",
+					"maxValidityBackdate": "1h5m",
+					"lintConfig": "test/config-next/zlint.toml",
+					"ignoredLints": [
+						"w_subject_common_name_included",
+						"e_dnsname_not_valid_tld",
+						"w_ext_subject_key_identifier_not_recommended_subscriber"
+					]
+				},
+				"shortlived": {
+					"omitCommonName": true,
+					"omitKeyEncipherment": true,
+					"omitClientAuth": true,
+					"omitSKID": true,
+					"maxValidityPeriod": "160h",
+					"maxValidityBackdate": "1h5m",
+					"lintConfig": "test/config-next/zlint.toml",
+					"ignoredLints": [
+						"w_ext_subject_key_identifier_missing_sub_cert",
+						"e_dnsname_not_valid_tld"
+					]
+				},
+				"modern": {
+					"omitCommonName": true,
+					"omitKeyEncipherment": true,
+					"omitClientAuth": true,
+					"omitSKID": true,
+					"maxValidityPeriod": "583200s",
+					"maxValidityBackdate": "1h5m",
+					"lintConfig": "test/config-next/zlint.toml",
+					"ignoredLints": [
+						"w_ext_subject_key_identifier_missing_sub_cert",
+						"e_dnsname_not_valid_tld"
+					]
+				}
+			},
+			"crlProfile": {
+				"validityInterval": "216h",
+				"maxBackdate": "1h5m",
+				"lintConfig": "test/config/zlint.toml"
 			},
 			"issuers": [
 				{
-					"useForRSALeaves": false,
-					"useForECDSALeaves": true,
+					"active": true,
+					"profiles": [
+						"legacy"
+					],
+					"crlShards": 10,
 					"issuerURL": "http://ca.example.org:4502/int-ecdsa-a",
-					"ocspURL": "http://ca.example.org:4002/",
-					"crlURLBase": "http://ca.example.org:4501/ecdsa-a/",
+					"crlURLBase": "http://ca.example.org:4501/lets-encrypt-crls/43104258997432926/",
 					"location": {
-						"configFile": "/hierarchy/int-ecdsa-a.pkcs11.json",
-						"certFile": "/hierarchy/int-ecdsa-a.cert.pem",
+						"configFile": "test/certs/webpki/int-ecdsa-a.pkcs11.json",
+						"certFile": "test/certs/webpki/int-ecdsa-a.cert.pem",
 						"numSessions": 2
 					}
 				},
 				{
-					"useForRSALeaves": true,
-					"useForECDSALeaves": true,
+					"active": true,
+					"profiles": [
+						"legacy",
+						"modern",
+						"shortlived"
+					],
+					"crlShards": 10,
+					"issuerURL": "http://ca.example.org:4502/int-ecdsa-b",
+					"crlURLBase": "http://ca.example.org:4501/lets-encrypt-crls/17302365692836921/",
+					"location": {
+						"configFile": "test/certs/webpki/int-ecdsa-b.pkcs11.json",
+						"certFile": "test/certs/webpki/int-ecdsa-b.cert.pem",
+						"numSessions": 2
+					}
+				},
+				{
+					"active": false,
+					"crlShards": 10,
+					"issuerURL": "http://ca.example.org:4502/int-ecdsa-c",
+					"crlURLBase": "http://ca.example.org:4501/lets-encrypt-crls/56560759852043581/",
+					"location": {
+						"configFile": "test/certs/webpki/int-ecdsa-c.pkcs11.json",
+						"certFile": "test/certs/webpki/int-ecdsa-c.cert.pem",
+						"numSessions": 2
+					}
+				},
+				{
+					"active": true,
+					"profiles": [
+						"legacy"
+					],
+					"crlShards": 10,
 					"issuerURL": "http://ca.example.org:4502/int-rsa-a",
-					"ocspURL": "http://ca.example.org:4002/",
-					"crlURLBase": "http://ca.example.org:4501/rsa-a/",
+					"crlURLBase": "http://ca.example.org:4501/lets-encrypt-crls/29947985078257530/",
 					"location": {
-						"configFile": "/hierarchy/int-rsa-a.pkcs11.json",
-						"certFile": "/hierarchy/int-rsa-a.cert.pem",
+						"configFile": "test/certs/webpki/int-rsa-a.pkcs11.json",
+						"certFile": "test/certs/webpki/int-rsa-a.cert.pem",
 						"numSessions": 2
 					}
 				},
 				{
-					"useForRSALeaves": false,
-					"useForECDSALeaves": false,
+					"active": true,
+					"profiles": [
+						"legacy",
+						"modern",
+						"shortlived"
+					],
+					"crlShards": 10,
 					"issuerURL": "http://ca.example.org:4502/int-rsa-b",
-					"ocspURL": "http://ca.example.org:4003/",
-					"crlURLBase": "http://ca.example.org:4501/rsa-b/",
+					"crlURLBase": "http://ca.example.org:4501/lets-encrypt-crls/6762885421992935/",
 					"location": {
-						"configFile": "/hierarchy/int-rsa-b.pkcs11.json",
-						"certFile": "/hierarchy/int-rsa-b.cert.pem",
+						"configFile": "test/certs/webpki/int-rsa-b.pkcs11.json",
+						"certFile": "test/certs/webpki/int-rsa-b.cert.pem",
+						"numSessions": 2
+					}
+				},
+				{
+					"active": false,
+					"crlShards": 10,
+					"issuerURL": "http://ca.example.org:4502/int-rsa-c",
+					"crlURLBase": "http://ca.example.org:4501/lets-encrypt-crls/56183656833365902/",
+					"location": {
+						"configFile": "test/certs/webpki/int-rsa-c.pkcs11.json",
+						"certFile": "test/certs/webpki/int-rsa-c.cert.pem",
 						"numSessions": 2
 					}
 				}
-			],
-			"ignoredLints": [
-				"w_subject_common_name_included",
-				"w_sub_cert_aia_contains_internal_names"
 			]
 		},
-		"expiry": "7776000s",
-		"backdate": "1h",
-		"serialPrefix": 127,
+		"serialPrefixHex": "6e",
 		"maxNames": 100,
-		"lifespanOCSP": "96h",
-		"lifespanCRL": "216h",
-		"goodkey": {
-			"weakKeyFile": "test/example-weak-keys.json",
-			"blockedKeyFile": "test/example-blocked-keys.yaml",
-			"fermatRounds": 100
-		},
+		"goodkey": {},
 		"ocspLogMaxLength": 4000,
-		"ocspLogPeriod": "500ms",
-		"ecdsaAllowListFilename": "test/config/ecdsaAllowList.yml",
+		"ctLogListFile": "test/ct-test-srv/log_list.json",
 		"features": {}
 	},
 	"pa": {
@@ -121,6 +192,10 @@
 			"http-01": true,
 			"dns-01": true,
 			"tls-alpn-01": true
+		},
+		"identifiers": {
+			"dns": true,
+			"ip": true
 		}
 	},
 	"syslog": {

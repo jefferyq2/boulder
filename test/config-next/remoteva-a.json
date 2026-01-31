@@ -7,18 +7,22 @@
 			"10.77.77.77:8443"
 		],
 		"dnsTimeout": "1s",
-		"dnsAllowLoopbackAddresses": true,
 		"issuerDomain": "happy-hacker-ca.invalid",
 		"tls": {
-			"caCertfile": "test/grpc-creds/minica.pem",
-			"certFile": "test/grpc-creds/rva.boulder/cert.pem",
-			"keyFile": "test/grpc-creds/rva.boulder/key.pem"
+			"caCertfile": "test/certs/ipki/minica.pem",
+			"certFile": "test/certs/ipki/rva.boulder/cert.pem",
+			"keyFile": "test/certs/ipki/rva.boulder/key.pem"
 		},
 		"skipGRPCClientCertVerification": true,
 		"grpc": {
 			"maxConnectionAge": "30s",
 			"services": {
 				"va.VA": {
+					"clientNames": [
+						"va.boulder"
+					]
+				},
+				"va.CAA": {
 					"clientNames": [
 						"va.boulder"
 					]
@@ -30,13 +34,15 @@
 				}
 			}
 		},
-		"features": {
-			"DOH": true
-		},
 		"accountURIPrefixes": [
-			"http://boulder.service.consul:4000/acme/reg/",
-			"http://boulder.service.consul:4001/acme/acct/"
-		]
+			"http://boulder.service.consul:4001/acme/acct/",
+			"http://boulder.service.consul:4000/acme/reg/"
+		],
+		"perspective": "dadaist",
+		"rir": "ARIN",
+		"features": {
+			"DNSAccount01Enabled": true
+		}
 	},
 	"syslog": {
 		"stdoutlevel": 4,

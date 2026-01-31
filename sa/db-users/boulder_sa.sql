@@ -5,7 +5,6 @@
 CREATE USER IF NOT EXISTS 'policy'@'localhost';
 CREATE USER IF NOT EXISTS 'sa'@'localhost';
 CREATE USER IF NOT EXISTS 'sa_ro'@'localhost';
-CREATE USER IF NOT EXISTS 'ocsp_resp'@'localhost';
 CREATE USER IF NOT EXISTS 'revoker'@'localhost';
 CREATE USER IF NOT EXISTS 'importer'@'localhost';
 CREATE USER IF NOT EXISTS 'mailer'@'localhost';
@@ -18,45 +17,41 @@ CREATE USER IF NOT EXISTS 'proxysql'@'localhost';
 GRANT SELECT,INSERT ON certificates TO 'sa'@'localhost';
 GRANT SELECT,INSERT,UPDATE ON certificateStatus TO 'sa'@'localhost';
 GRANT SELECT,INSERT ON issuedNames TO 'sa'@'localhost';
-GRANT SELECT,INSERT,UPDATE ON certificatesPerName TO 'sa'@'localhost';
 GRANT SELECT,INSERT,UPDATE ON registrations TO 'sa'@'localhost';
 GRANT SELECT,INSERT on fqdnSets TO 'sa'@'localhost';
 GRANT SELECT,INSERT,UPDATE ON orders TO 'sa'@'localhost';
 GRANT SELECT,INSERT,DELETE ON orderFqdnSets TO 'sa'@'localhost';
 GRANT SELECT,INSERT,UPDATE ON authz2 TO 'sa'@'localhost';
-GRANT SELECT,INSERT ON orderToAuthz2 TO 'sa'@'localhost';
 GRANT INSERT,SELECT ON serials TO 'sa'@'localhost';
 GRANT SELECT,INSERT ON precertificates TO 'sa'@'localhost';
 GRANT SELECT,INSERT ON keyHashToSerial TO 'sa'@'localhost';
 GRANT SELECT,INSERT ON blockedKeys TO 'sa'@'localhost';
-GRANT SELECT,INSERT,UPDATE ON newOrdersRL TO 'sa'@'localhost';
 GRANT SELECT ON incidents TO 'sa'@'localhost';
 GRANT SELECT,INSERT,UPDATE ON crlShards TO 'sa'@'localhost';
 GRANT SELECT,INSERT,UPDATE ON revokedCertificates TO 'sa'@'localhost';
 GRANT SELECT,INSERT,UPDATE ON replacementOrders TO 'sa'@'localhost';
+GRANT SELECT,INSERT,UPDATE ON overrides TO 'sa'@'localhost';
+-- Tests need to be able to remove rows from this table, so DELETE,DROP is necessary.
+GRANT SELECT,INSERT,UPDATE,DELETE,DROP ON paused TO 'sa'@'localhost';
 
 GRANT SELECT ON certificates TO 'sa_ro'@'localhost';
 GRANT SELECT ON certificateStatus TO 'sa_ro'@'localhost';
 GRANT SELECT ON issuedNames TO 'sa_ro'@'localhost';
-GRANT SELECT ON certificatesPerName TO 'sa_ro'@'localhost';
 GRANT SELECT ON registrations TO 'sa_ro'@'localhost';
 GRANT SELECT on fqdnSets TO 'sa_ro'@'localhost';
 GRANT SELECT ON orders TO 'sa_ro'@'localhost';
 GRANT SELECT ON orderFqdnSets TO 'sa_ro'@'localhost';
 GRANT SELECT ON authz2 TO 'sa_ro'@'localhost';
-GRANT SELECT ON orderToAuthz2 TO 'sa_ro'@'localhost';
 GRANT SELECT ON serials TO 'sa_ro'@'localhost';
 GRANT SELECT ON precertificates TO 'sa_ro'@'localhost';
 GRANT SELECT ON keyHashToSerial TO 'sa_ro'@'localhost';
 GRANT SELECT ON blockedKeys TO 'sa_ro'@'localhost';
-GRANT SELECT ON newOrdersRL TO 'sa_ro'@'localhost';
 GRANT SELECT ON incidents TO 'sa_ro'@'localhost';
 GRANT SELECT ON crlShards TO 'sa_ro'@'localhost';
 GRANT SELECT ON revokedCertificates TO 'sa_ro'@'localhost';
 GRANT SELECT ON replacementOrders TO 'sa_ro'@'localhost';
-
--- OCSP Responder
-GRANT SELECT ON certificateStatus TO 'ocsp_resp'@'localhost';
+GRANT SELECT ON paused TO 'sa_ro'@'localhost';
+GRANT SELECT ON overrides TO 'sa_ro'@'localhost';
 
 -- Revoker Tool
 GRANT SELECT,UPDATE ON registrations TO 'revoker'@'localhost';

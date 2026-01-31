@@ -22,27 +22,28 @@ type s3TestSrv struct {
 }
 
 func (srv *s3TestSrv) handleS3(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "PUT" {
+	switch r.Method {
+	case "PUT":
 		srv.handleUpload(w, r)
-	} else if r.Method == "GET" {
+	case "GET":
 		srv.handleDownload(w, r)
-	} else {
-		w.WriteHeader(405)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
 func (srv *s3TestSrv) handleUpload(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		w.WriteHeader(500)
+		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte("failed to read request body"))
 		return
 	}
 
 	crl, err := x509.ParseRevocationList(body)
 	if err != nil {
-		w.WriteHeader(500)
-		w.Write([]byte(fmt.Sprintf("failed to parse body: %s", err)))
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write(fmt.Appendf(nil, "failed to parse body: %s", err))
 		return
 	}
 
@@ -53,7 +54,7 @@ func (srv *s3TestSrv) handleUpload(w http.ResponseWriter, r *http.Request) {
 		srv.allSerials[core.SerialToString(rc.SerialNumber)] = revocation.Reason(rc.ReasonCode)
 	}
 
-	w.WriteHeader(200)
+	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("{}"))
 }
 
@@ -62,22 +63,22 @@ func (srv *s3TestSrv) handleDownload(w http.ResponseWriter, r *http.Request) {
 	defer srv.RUnlock()
 	body, ok := srv.allShards[r.URL.Path]
 	if !ok {
-		w.WriteHeader(404)
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	w.WriteHeader(200)
+	w.WriteHeader(http.StatusOK)
 	w.Write(body)
 }
 
 func (srv *s3TestSrv) handleQuery(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
-		w.WriteHeader(405)
+		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 
 	serial := r.URL.Query().Get("serial")
 	if serial == "" {
-		w.WriteHeader(400)
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
@@ -85,12 +86,26 @@ func (srv *s3TestSrv) handleQuery(w http.ResponseWriter, r *http.Request) {
 	defer srv.RUnlock()
 	reason, ok := srv.allSerials[serial]
 	if !ok {
-		w.WriteHeader(404)
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	w.WriteHeader(200)
-	w.Write([]byte(fmt.Sprintf("%d", reason)))
+	w.WriteHeader(http.StatusOK)
+	w.Write(fmt.Appendf(nil, "%d", reason))
+}
+
+func (srv *s3TestSrv) handleReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	srv.Lock()
+	defer srv.Unlock()
+	srv.allSerials = make(map[string]revocation.Reason)
+	srv.allShards = make(map[string][]byte)
+
+	w.WriteHeader(http.StatusOK)
 }
 
 func main() {
@@ -104,6 +119,7 @@ func main() {
 
 	http.HandleFunc("/", srv.handleS3)
 	http.HandleFunc("/query", srv.handleQuery)
+	http.HandleFunc("/reset", srv.handleReset)
 
 	s := http.Server{
 		ReadTimeout: 30 * time.Second,

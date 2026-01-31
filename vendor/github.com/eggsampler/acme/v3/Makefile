@@ -60,6 +60,7 @@ boulder_setup:
 	-git clone --depth 1 https://github.com/letsencrypt/boulder.git $(BOULDER_PATH)
 	(cd $(BOULDER_PATH); git checkout -f main && git reset --hard HEAD && git pull -q)
 	make boulder_stop
+	(cd $(BOULDER_PATH); docker compose run --rm bsetup)
 
 # runs an instance of boulder
 boulder_start:

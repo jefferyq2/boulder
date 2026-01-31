@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jmhodges/clock"
+
 	"github.com/letsencrypt/boulder/issuance"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
@@ -26,9 +27,11 @@ func TestRunOnce(t *testing.T) {
 		[]*issuance.Certificate{e1, r3},
 		2, 18*time.Hour, 24*time.Hour,
 		6*time.Hour, time.Minute, 1, 1,
-		&fakeSAC{grcc: fakeGRCC{err: errors.New("db no worky")}, maxNotAfter: clk.Now().Add(90 * 24 * time.Hour)},
-		&fakeCGC{gcc: fakeGCC{}},
-		&fakeCSC{ucc: fakeUCC{}},
+		"stale-if-error=60",
+		5*time.Minute,
+		&fakeSAC{revokedCerts: revokedCertsStream{err: errors.New("db no worky")}, maxNotAfter: clk.Now().Add(90 * 24 * time.Hour)},
+		&fakeCA{gcc: generateCRLStream{}},
+		&fakeStorer{uploaderStream: &noopUploader{}},
 		metrics.NoopRegisterer, mockLog, clk,
 	)
 	test.AssertNotError(t, err, "building test crlUpdater")
@@ -38,6 +41,6 @@ func TestRunOnce(t *testing.T) {
 	err = cu.RunOnce(context.Background())
 	test.AssertError(t, err, "database error")
 	test.AssertContains(t, err.Error(), "one or more errors")
-	test.AssertEquals(t, len(mockLog.GetAllMatching("Generating CRL failed:")), 4)
+	test.AssertEquals(t, len(mockLog.GetAllMatching("Generating CRL failed")), 4)
 	cu.tickHistogram.Reset()
 }

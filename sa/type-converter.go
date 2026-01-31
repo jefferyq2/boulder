@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/go-jose/go-jose/v4"
 
@@ -17,7 +18,7 @@ import (
 type BoulderTypeConverter struct{}
 
 // ToDb converts a Boulder object to one suitable for the DB representation.
-func (tc BoulderTypeConverter) ToDb(val interface{}) (interface{}, error) {
+func (tc BoulderTypeConverter) ToDb(val any) (any, error) {
 	switch t := val.(type) {
 	case identifier.ACMEIdentifier, []core.Challenge, []string, [][]int:
 		jsonBytes, err := json.Marshal(t)
@@ -35,16 +36,28 @@ func (tc BoulderTypeConverter) ToDb(val interface{}) (interface{}, error) {
 		return string(t), nil
 	case core.OCSPStatus:
 		return string(t), nil
+	// Time types get truncated to the nearest second. Given our DB schema,
+	// only seconds are stored anyhow. Avoiding sending queries with sub-second
+	// precision may help the query planner avoid pathological cases when
+	// querying against indexes on time fields (#5437).
+	case time.Time:
+		return t.Truncate(time.Second), nil
+	case *time.Time:
+		if t == nil {
+			return nil, nil
+		}
+		newT := t.Truncate(time.Second)
+		return &newT, nil
 	default:
 		return val, nil
 	}
 }
 
 // FromDb converts a DB representation back into a Boulder object.
-func (tc BoulderTypeConverter) FromDb(target interface{}) (borp.CustomScanner, bool) {
+func (tc BoulderTypeConverter) FromDb(target any) (borp.CustomScanner, bool) {
 	switch target.(type) {
 	case *identifier.ACMEIdentifier, *[]core.Challenge, *[]string, *[][]int:
-		binder := func(holder, target interface{}) error {
+		binder := func(holder, target any) error {
 			s, ok := holder.(*string)
 			if !ok {
 				return errors.New("FromDb: Unable to convert *string")
@@ -61,7 +74,7 @@ func (tc BoulderTypeConverter) FromDb(target interface{}) (borp.CustomScanner, b
 		}
 		return borp.CustomScanner{Holder: new(string), Target: target, Binder: binder}, true
 	case *jose.JSONWebKey:
-		binder := func(holder, target interface{}) error {
+		binder := func(holder, target any) error {
 			s, ok := holder.(*string)
 			if !ok {
 				return fmt.Errorf("FromDb: Unable to convert %T to *string", holder)
@@ -85,7 +98,7 @@ func (tc BoulderTypeConverter) FromDb(target interface{}) (borp.CustomScanner, b
 		}
 		return borp.CustomScanner{Holder: new(string), Target: target, Binder: binder}, true
 	case *core.AcmeStatus:
-		binder := func(holder, target interface{}) error {
+		binder := func(holder, target any) error {
 			s, ok := holder.(*string)
 			if !ok {
 				return fmt.Errorf("FromDb: Unable to convert %T to *string", holder)
@@ -100,7 +113,7 @@ func (tc BoulderTypeConverter) FromDb(target interface{}) (borp.CustomScanner, b
 		}
 		return borp.CustomScanner{Holder: new(string), Target: target, Binder: binder}, true
 	case *core.OCSPStatus:
-		binder := func(holder, target interface{}) error {
+		binder := func(holder, target any) error {
 			s, ok := holder.(*string)
 			if !ok {
 				return fmt.Errorf("FromDb: Unable to convert %T to *string", holder)

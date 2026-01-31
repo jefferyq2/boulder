@@ -4,7 +4,7 @@ import (
 	"crypto/rsa"
 	"encoding/json"
 	"math/big"
-	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -39,8 +39,8 @@ func TestRecordSanityCheckOnUnsupportedChallengeType(t *testing.T) {
 			URL:               "http://localhost/test",
 			Hostname:          "localhost",
 			Port:              "80",
-			AddressesResolved: []net.IP{{127, 0, 0, 1}},
-			AddressUsed:       net.IP{127, 0, 0, 1},
+			AddressesResolved: []netip.Addr{netip.MustParseAddr("127.0.0.1")},
+			AddressUsed:       netip.MustParseAddr("127.0.0.1"),
 			ResolverAddrs:     []string{"eastUnboundAndDown"},
 		},
 	}
@@ -59,30 +59,20 @@ func TestChallengeSanityCheck(t *testing.T) {
   }`), &accountKey)
 	test.AssertNotError(t, err, "Error unmarshaling JWK")
 
-	types := []AcmeChallenge{ChallengeTypeHTTP01, ChallengeTypeDNS01, ChallengeTypeTLSALPN01}
+	types := []AcmeChallenge{ChallengeTypeHTTP01, ChallengeTypeDNS01, ChallengeTypeTLSALPN01, ChallengeTypeDNSAccount01}
 	for _, challengeType := range types {
 		chall := Challenge{
 			Type:   challengeType,
 			Status: StatusInvalid,
 		}
-		test.AssertError(t, chall.CheckConsistencyForClientOffer(), "CheckConsistencyForClientOffer didn't return an error")
+		test.AssertError(t, chall.CheckPending(), "CheckConsistencyForClientOffer didn't return an error")
 
 		chall.Status = StatusPending
-		test.AssertError(t, chall.CheckConsistencyForClientOffer(), "CheckConsistencyForClientOffer didn't return an error")
+		test.AssertError(t, chall.CheckPending(), "CheckConsistencyForClientOffer didn't return an error")
 
 		chall.Token = "KQqLsiS5j0CONR_eUXTUSUDNVaHODtc-0pD6ACif7U4"
-		test.AssertNotError(t, chall.CheckConsistencyForClientOffer(), "CheckConsistencyForClientOffer returned an error")
-
-		chall.ProvidedKeyAuthorization = chall.Token + ".AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-		test.AssertNotError(t, chall.CheckConsistencyForValidation(), "CheckConsistencyForValidation returned an error")
-
-		chall.ProvidedKeyAuthorization = "aaaa.aaaa"
-		test.AssertError(t, chall.CheckConsistencyForValidation(), "CheckConsistencyForValidation didn't return an error")
+		test.AssertNotError(t, chall.CheckPending(), "CheckConsistencyForClientOffer returned an error")
 	}
-
-	chall := Challenge{Type: "bogus", Status: StatusPending}
-	test.AssertError(t, chall.CheckConsistencyForClientOffer(), "CheckConsistencyForClientOffer didn't return an error")
-	test.AssertError(t, chall.CheckConsistencyForValidation(), "CheckConsistencyForValidation didn't return an error")
 }
 
 func TestJSONBufferUnmarshal(t *testing.T) {
@@ -110,7 +100,7 @@ func TestAuthorizationSolvedBy(t *testing.T) {
 		{
 			Name:          "No challenges",
 			Authz:         Authorization{},
-			ExpectedError: "Authorization has no challenges",
+			ExpectedError: "authorization has no challenges",
 		},
 		// An authz with all non-valid challenges should return nil
 		{
@@ -118,7 +108,7 @@ func TestAuthorizationSolvedBy(t *testing.T) {
 			Authz: Authorization{
 				Challenges: []Challenge{HTTPChallenge01(""), DNSChallenge01("")},
 			},
-			ExpectedError: "Authorization not solved by any challenge",
+			ExpectedError: "authorization not solved by any challenge",
 		},
 		// An authz with one valid HTTP01 challenge amongst other challenges should
 		// return the HTTP01 challenge
@@ -162,6 +152,8 @@ func TestChallengeStringID(t *testing.T) {
 	test.AssertEquals(t, ch.StringID(), "iFVMwA")
 	ch.Type = ChallengeTypeHTTP01
 	test.AssertEquals(t, ch.StringID(), "0Gexug")
+	ch.Type = ChallengeTypeDNSAccount01
+	test.AssertEquals(t, ch.StringID(), "8z2wSg")
 }
 
 func TestFindChallengeByType(t *testing.T) {

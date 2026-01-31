@@ -41,10 +41,6 @@ def temppath(name):
 def fakeclock(date):
     return date.strftime("%a %b %d %H:%M:%S UTC %Y")
 
-def get_future_output(cmd, date):
-    return subprocess.check_output(cmd, stderr=subprocess.STDOUT,
-        env={'FAKECLOCK': fakeclock(date)}).decode()
-
 def random_domain():
     """Generate a random domain for testing (to avoid rate limiting)."""
     return "rand.%x.xyz" % random.randrange(2**32)
@@ -86,7 +82,7 @@ def ocsp_verify(cert_file, issuer_file, ocsp_response):
             '-issuer', issuer_file,
             '-cert', cert_file,
             '-verify_other', issuer_file,
-            '-CAfile', '/hierarchy/root-rsa.cert.pem',
+            '-CAfile', 'test/certs/webpki/root-rsa.cert.pem',
             '-respin', f.name], stderr=subprocess.STDOUT).decode()
     # OpenSSL doesn't always return non-zero when response verify fails, so we
     # also look for the string "Response Verify Failure"
@@ -138,45 +134,6 @@ def try_verify_ocsp(cert_file, issuer_file, url, status="revoked", reason=None):
             raise(Exception("OCSP response wasn't '%s'" % reason))
     return verify_output
 
-def reset_akamai_purges():
-    requests.post("http://localhost:6789/debug/reset-purges", data="{}")
-
-def verify_akamai_purge():
-    deadline = time.time() + .4
-    while True:
-        time.sleep(0.05)
-        if time.time() > deadline:
-            raise(Exception("Timed out waiting for Akamai purge"))
-        response = requests.get("http://localhost:6789/debug/get-purges")
-        purgeData = response.json()
-        if len(purgeData["V3"]) == 0:
-            continue
-        break
-    reset_akamai_purges()
-
-twenty_days_ago_functions = [ ]
-
-def register_twenty_days_ago(f):
-    """Register a function to be run during "setup_twenty_days_ago." This allows
-       test cases to define their own custom setup.
-    """
-    twenty_days_ago_functions.append(f)
-
-def setup_twenty_days_ago():
-    """Do any setup that needs to happen 20 day in the past, for tests that
-       will run in the 'present'.
-    """
-    for f in twenty_days_ago_functions:
-        f()
-
-six_months_ago_functions = []
-
-def register_six_months_ago(f):
-    six_months_ago_functions.append(f)
-
-def setup_six_months_ago():
-    [f() for f in six_months_ago_functions]
-
 def waitport(port, prog, perTickCheck=None):
     """Wait until a port on localhost is open."""
     for _ in range(1000):
@@ -195,9 +152,12 @@ def waitport(port, prog, perTickCheck=None):
                 raise
     raise(Exception("timed out waiting for debug port %d (%s)" % (port, prog)))
 
-def waithealth(prog, port, host_override):
+def waithealth(prog, addr, host_override):
+    if type(addr) == int:
+        addr = "localhost:%d" % (addr)
+
     subprocess.check_call([
         './bin/health-checker',
-        '-addr', ("localhost:%d" % (port)),
+        '-addr', addr,
         '-host-override', host_override,
         '-config', os.path.join(config_dir, 'health-checker.json')])

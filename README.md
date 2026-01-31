@@ -3,10 +3,10 @@
 [![Build Status](https://github.com/letsencrypt/boulder/actions/workflows/boulder-ci.yml/badge.svg?branch=main)](https://github.com/letsencrypt/boulder/actions/workflows/boulder-ci.yml?query=branch%3Amain)
 
 This is an implementation of an ACME-based CA. The [ACME
-protocol](https://github.com/ietf-wg-acme/acme/) allows the CA to
-automatically verify that an applicant for a certificate actually controls an
-identifier, and allows domain holders to issue and revoke certificates for
-their domains. Boulder is the software that runs [Let's
+protocol](https://github.com/ietf-wg-acme/acme/) allows the CA to automatically
+verify that an applicant for a certificate actually controls an identifier, and
+allows subscribers to issue and revoke certificates for the identifiers they
+control. Boulder is the software that runs [Let's
 Encrypt](https://letsencrypt.org).
 
 ## Contents
@@ -30,11 +30,10 @@ Boulder is divided into the following main components:
 4. Certificate Authority
 5. Storage Authority
 6. Publisher
-7. OCSP Responder
-8. CRL Updater
+7. CRL Updater
 
 This component model lets us separate the function of the CA by security
-context. The Web Front End, Validation Authority, OCSP Responder and
+context. The Web Front End, Validation Authority, CRL Storer, and
 Publisher need access to the Internet, which puts them at greater risk of
 compromise. The Registration Authority can live without Internet
 connectivity, but still needs to talk to the Web Front End and Validation
@@ -50,7 +49,7 @@ lines indicating SA RPCs are not shown here.
                              |               ^
 Subscriber server <- VA <----+               |
                                              |
-          Browser -------------------> OCSP Responder
+          Browser -----> S3 <----- CRL Storer/Updater
 ```
 
 Internally, the logic of the system is based around five types of objects:
@@ -104,47 +103,67 @@ We recommend having **at least 2GB of RAM** available on your Docker host. In
 practice using less RAM may result in the MariaDB container failing in
 non-obvious ways.
 
-To start Boulder in a Docker container, run:
-
-```shell
-docker compose up
-```
-
 To run our standard battery of tests (lints, unit, integration):
 
 ```shell
-docker compose run --use-aliases boulder ./test.sh
+./t.sh
 ```
 
 To run all unit tests:
 
 ```shell
-docker compose run --use-aliases boulder ./test.sh --unit
+./t.sh -u
 ```
 
 To run specific unit tests (example is of the ./va directory):
 
 ```shell
-docker compose run --use-aliases boulder ./test.sh --unit --filter=./va
+./t.sh -u -p ./va
 ```
 
 To run all integration tests:
 
 ```shell
-docker compose run --use-aliases boulder ./test.sh --integration
+./t.sh -i
 ```
 
-To run specific integration tests (example runs TestAkamaiPurgerDrainQueueFails and TestWFECORS):
+To run unit tests and integration tests with coverage:
 
 ```shell
-docker compose run --use-aliases boulder ./test.sh --filter TestAkamaiPurgerDrainQueueFails/TestWFECORS
+./t.sh -ui -c --coverage-dir=./test/coverage/mytestrun
 ```
 
-To get a list of available integration tests:
+To run specific integration tests (example runs TestGenerateValidity and TestWFECORS):
 
 ```shell
-docker compose run --use-aliases boulder ./test.sh --list-integration-tests
+./t.sh -i -f TestGenerateValidity/TestWFECORS
 ```
+
+To do any of the above, but using the "config-next" configuration, which
+represents a likely future state (e.g. including new feature flags):
+
+```shell
+./tn.sh -your -options -here
+```
+
+To start Boulder in a Docker container, first run:
+
+```shell
+docker compose run bsetup
+```
+this will write the necessary certificates into `test/certs/[.softhsm-tokens,ipki,webpki]`;
+You only need to run this once to create the certificates. If you
+need to remove all of the certificates and start over, you can remove
+the directories `./test/certs/.softhsm-tokens`, `./test/certs/ipki`,
+and `./test/certs/webpki` and re-run `docker compose run bsetup`.
+
+Then run:
+
+```shell
+docker compose up
+```
+
+
 
 The configuration in docker-compose.yml mounts your boulder checkout at
 /boulder so you can edit code on your host and it will be immediately
@@ -181,7 +200,13 @@ docker compose run --use-aliases -e FAKE_DNS=172.17.0.1 --service-ports boulder 
 
 Running tests without the `./test.sh` wrapper:
 
-Run all unit tests
+Run unit tests locally, without docker (only works for some directories):
+
+```shell
+go test ./issuance/...
+```
+
+Run all unit tests:
 
 ```shell
 docker compose run --use-aliases boulder go test -p 1 ./...
@@ -229,8 +254,8 @@ the following URLs:
 
 To access the HTTPS versions of the endpoints you will need to configure your
 ACME client software to use a CA truststore that contains the
-`test/wfe-tls/minica.pem` CA certificate. See
-[`test/PKI.md`](https://github.com/letsencrypt/boulder/blob/main/test/PKI.md)
+`test/certs/ipki/minica.pem` CA certificate. See
+[`test/certs/README.md`](https://github.com/letsencrypt/boulder/blob/main/test/certs/README.md)
 for more information.
 
 Your local Boulder instance uses a fake DNS resolver that returns 127.0.0.1

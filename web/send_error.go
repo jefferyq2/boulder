@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -37,8 +38,15 @@ func SendError(
 		response.WriteHeader(http.StatusInternalServerError)
 	}
 
+	// Suppress logging of the "Your account is temporarily prevented from
+	// requesting certificates" error.
+	var primaryDetail = prob.Detail
+	if prob.Type == probs.PausedProblem {
+		primaryDetail = "account/ident pair is paused"
+	}
+
 	// Record details to the log event
-	logEvent.Error = fmt.Sprintf("%d :: %s :: %s", prob.HTTPStatus, prob.Type, prob.Detail)
+	logEvent.Error = fmt.Sprintf("%d :: %s :: %s", prob.HTTPStatus, prob.Type, primaryDetail)
 	if len(prob.SubProblems) > 0 {
 		subDetails := make([]string, len(prob.SubProblems))
 		for i, sub := range prob.SubProblems {
@@ -47,7 +55,7 @@ func SendError(
 		logEvent.Error += fmt.Sprintf(" [%s]", strings.Join(subDetails, ", "))
 	}
 	if ierr != nil {
-		logEvent.AddError(fmt.Sprintf("%s", ierr))
+		logEvent.AddError("%s", ierr)
 	}
 
 	// Set the proper namespace for the problem and any sub-problems.
@@ -56,10 +64,19 @@ func SendError(
 		prob.SubProblems[i].Type = probs.ProblemType(probs.ErrorNS) + prob.SubProblems[i].Type
 	}
 
-	problemDoc, err := json.MarshalIndent(prob, "", "  ")
+	var problemDoc []byte
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetIndent("", "  ")
+	// Avoid escaping characters: <, >, &, some of our log messages contain
+	// these characters and we want them to be human readable.
+	enc.SetEscapeHTML(false)
+	err := enc.Encode(prob)
 	if err != nil {
-		log.AuditErrf("Could not marshal error message: %s - %+v", err, prob)
+		logEvent.AddError("%s", err)
 		problemDoc = []byte("{\"detail\": \"Problem marshalling error message.\"}")
+	} else {
+		problemDoc = bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
 	}
 
 	response.Write(problemDoc)

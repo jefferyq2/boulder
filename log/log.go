@@ -1,6 +1,7 @@
 package log
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -24,20 +25,16 @@ import (
 // NewMock(). Any additions to this interface with format strings should be
 // added to the govet configuration in .golangci.yml
 type Logger interface {
-	Err(msg string)
-	Errf(format string, a ...interface{})
+	Errf(format string, a ...any)
 	Warning(msg string)
-	Warningf(format string, a ...interface{})
+	Warningf(format string, a ...any)
 	Info(msg string)
-	Infof(format string, a ...interface{})
-	InfoObject(string, interface{})
+	Infof(format string, a ...any)
+	InfoObject(string, any)
 	Debug(msg string)
-	Debugf(format string, a ...interface{})
-	AuditInfo(msg string)
-	AuditInfof(format string, a ...interface{})
-	AuditObject(string, interface{})
-	AuditErr(string)
-	AuditErrf(format string, a ...interface{})
+	Debugf(format string, a ...any)
+	AuditInfo(string, any)
+	AuditErr(string, error, map[string]any)
 }
 
 // impl implements Logger.
@@ -136,7 +133,7 @@ func Get() Logger {
 }
 
 type writer interface {
-	logAtLevel(syslog.Priority, string, ...interface{})
+	logAtLevel(syslog.Priority, string, ...any)
 }
 
 // bothWriter implements writer and writes to both syslog and stdout.
@@ -160,12 +157,13 @@ type stdoutWriter struct {
 	isatty    bool
 }
 
+// LogLineChecksum computes a CRC32 over the log line, which can be checked by
+// log-validator to ensure no unexpected log corruption has occurred.
 func LogLineChecksum(line string) string {
 	crc := crc32.ChecksumIEEE([]byte(line))
-	// Using the hash.Hash32 doesn't make this any easier
-	// as it also returns a uint32 rather than []byte
-	buf := make([]byte, binary.MaxVarintLen32)
-	binary.PutUvarint(buf, uint64(crc))
+	buf := make([]byte, crc32.Size)
+	// Error is unreachable because we provide a supported type and buffer size
+	_, _ = binary.Encode(buf, binary.LittleEndian, crc)
 	return base64.RawURLEncoding.EncodeToString(buf)
 }
 
@@ -175,7 +173,7 @@ func checkSummed(msg string) string {
 
 // logAtLevel logs the provided message at the appropriate level, writing to
 // both stdout and the Logger
-func (w *bothWriter) logAtLevel(level syslog.Priority, msg string, a ...interface{}) {
+func (w *bothWriter) logAtLevel(level syslog.Priority, msg string, a ...any) {
 	var err error
 
 	// Apply conditional formatting for f functions
@@ -185,7 +183,7 @@ func (w *bothWriter) logAtLevel(level syslog.Priority, msg string, a ...interfac
 
 	// Since messages are delimited by newlines, we have to escape any internal or
 	// trailing newlines before generating the checksum or outputting the message.
-	msg = strings.Replace(msg, "\n", "\\n", -1)
+	msg = strings.ReplaceAll(msg, "\n", "\\n")
 
 	w.Lock()
 	defer w.Unlock()
@@ -219,7 +217,7 @@ func (w *bothWriter) logAtLevel(level syslog.Priority, msg string, a ...interfac
 }
 
 // logAtLevel logs the provided message to stdout, or stderr if it is at Warning or Error level.
-func (w *stdoutWriter) logAtLevel(level syslog.Priority, msg string, a ...interface{}) {
+func (w *stdoutWriter) logAtLevel(level syslog.Priority, msg string, a ...any) {
 	if int(level) <= w.level {
 		output := w.stdout
 		if int(level) <= int(syslog.LOG_WARNING) {
@@ -231,7 +229,7 @@ func (w *stdoutWriter) logAtLevel(level syslog.Priority, msg string, a ...interf
 			msg = fmt.Sprintf(msg, a...)
 		}
 
-		msg = strings.Replace(msg, "\n", "\\n", -1)
+		msg = strings.ReplaceAll(msg, "\n", "\\n")
 
 		var color string
 		var reset string
@@ -266,21 +264,15 @@ func (w *stdoutWriter) logAtLevel(level syslog.Priority, msg string, a ...interf
 	}
 }
 
-func (log *impl) auditAtLevel(level syslog.Priority, msg string, a ...interface{}) {
+func (log *impl) auditAtLevel(level syslog.Priority, msg string) {
 	msg = fmt.Sprintf("%s %s", auditTag, msg)
-	log.w.logAtLevel(level, msg, a...)
-}
-
-// Err level messages are always marked with the audit tag, for special handling
-// at the upstream system logger.
-func (log *impl) Err(msg string) {
-	log.Errf(msg)
+	log.w.logAtLevel(level, msg)
 }
 
 // Errf level messages are always marked with the audit tag, for special handling
 // at the upstream system logger.
-func (log *impl) Errf(format string, a ...interface{}) {
-	log.auditAtLevel(syslog.LOG_ERR, format, a...)
+func (log *impl) Errf(format string, a ...any) {
+	log.w.logAtLevel(syslog.LOG_ERR, format, a...)
 }
 
 // Warning level messages pass through normally.
@@ -289,7 +281,7 @@ func (log *impl) Warning(msg string) {
 }
 
 // Warningf level messages pass through normally.
-func (log *impl) Warningf(format string, a ...interface{}) {
+func (log *impl) Warningf(format string, a ...any) {
 	log.w.logAtLevel(syslog.LOG_WARNING, format, a...)
 }
 
@@ -299,13 +291,13 @@ func (log *impl) Info(msg string) {
 }
 
 // Infof level messages pass through normally.
-func (log *impl) Infof(format string, a ...interface{}) {
+func (log *impl) Infof(format string, a ...any) {
 	log.w.logAtLevel(syslog.LOG_INFO, format, a...)
 }
 
 // InfoObject logs an INFO level JSON-serialized object message.
-func (log *impl) InfoObject(msg string, obj interface{}) {
-	jsonObj, err := json.Marshal(obj)
+func (log *impl) InfoObject(msg string, obj any) {
+	jsonObj, err := formatObj(obj)
 	if err != nil {
 		log.auditAtLevel(syslog.LOG_ERR, fmt.Sprintf("Object for msg %q could not be serialized to JSON. Raw: %+v", msg, obj))
 		return
@@ -321,26 +313,14 @@ func (log *impl) Debug(msg string) {
 }
 
 // Debugf level messages pass through normally.
-func (log *impl) Debugf(format string, a ...interface{}) {
+func (log *impl) Debugf(format string, a ...any) {
 	log.w.logAtLevel(syslog.LOG_DEBUG, format, a...)
 }
 
-// AuditInfo sends an INFO-severity message that is prefixed with the
-// audit tag, for special handling at the upstream system logger.
-func (log *impl) AuditInfo(msg string) {
-	log.AuditInfof(msg)
-}
-
-// AuditInfof sends an INFO-severity message that is prefixed with the
-// audit tag, for special handling at the upstream system logger.
-func (log *impl) AuditInfof(format string, a ...interface{}) {
-	log.auditAtLevel(syslog.LOG_INFO, format, a...)
-}
-
-// AuditObject sends an INFO-severity JSON-serialized object message that is prefixed
+// AuditInfo sends an INFO-severity JSON-serialized object message that is prefixed
 // with the audit tag, for special handling at the upstream system logger.
-func (log *impl) AuditObject(msg string, obj interface{}) {
-	jsonObj, err := json.Marshal(obj)
+func (log *impl) AuditInfo(msg string, obj any) {
+	jsonObj, err := formatObj(obj)
 	if err != nil {
 		log.auditAtLevel(syslog.LOG_ERR, fmt.Sprintf("Object for msg %q could not be serialized to JSON. Raw: %+v", msg, obj))
 		return
@@ -349,12 +329,38 @@ func (log *impl) AuditObject(msg string, obj interface{}) {
 	log.auditAtLevel(syslog.LOG_INFO, fmt.Sprintf("%s JSON=%s", msg, jsonObj))
 }
 
-// AuditErr can format an error for auditing; it does so at ERR level.
-func (log *impl) AuditErr(msg string) {
-	log.AuditErrf(msg)
+// AuditErr sends an ERROR-level JSON-serialized message that is prefixed with
+// the audit tag. It restricts its last argument to map[string]any, rather than
+// allowing any struct at all like AuditInfo, so that it can add the given error
+// to that map under the key "error".
+func (log *impl) AuditErr(msg string, err error, obj map[string]any) {
+	if err != nil {
+		if obj == nil {
+			obj = make(map[string]any)
+		}
+		obj["error"] = err.Error()
+	}
+
+	jsonObj, err := formatObj(obj)
+	if err != nil {
+		log.auditAtLevel(syslog.LOG_ERR, fmt.Sprintf("Object for msg %q could not be serialized to JSON. Raw: %+v", msg, obj))
+		return
+	}
+
+	log.auditAtLevel(syslog.LOG_ERR, fmt.Sprintf("%s JSON=%s", msg, jsonObj))
 }
 
-// AuditErrf can format an error for auditing; it does so at ERR level.
-func (log *impl) AuditErrf(format string, a ...interface{}) {
-	log.auditAtLevel(syslog.LOG_ERR, format, a...)
+// formatObj marshals any object to json. It's the equivalent of json.Marshal,
+// except that it doesn't escape <, >, and &, and it doesn't include the
+// trailing newline. Code based on appendJSONMarshal from the slog package.
+func formatObj(obj any) (string, error) {
+	var bb bytes.Buffer
+	enc := json.NewEncoder(&bb)
+	enc.SetEscapeHTML(false)
+	err := enc.Encode(obj)
+	if err != nil {
+		return "", err
+	}
+	bs := bb.String()
+	return strings.TrimRight(bs, "\n"), nil
 }
